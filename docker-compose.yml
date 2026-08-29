@@ -15,6 +15,3 @@ services:
       - NODE_ENV=production
       - PORT=8090
       - BASE_PATH=/monitor
-      # токен бота — не хранить прямо тут (файл в git), см. .env рядом
-      # с docker-compose.yml на VPS (docker compose подхватывает его сам)
-      - TG_BOT_TOKEN=${TG_BOT_TOKEN}
