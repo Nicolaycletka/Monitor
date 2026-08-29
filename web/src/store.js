@@ -6,7 +6,8 @@
  * "последняя запись побеждает" на основе updatedAt.
  */
 
-import { predictNext, hhmm } from "./sleep.js";
+import { predictNext, hhmm, durShort } from "./sleep.js";
+import { feedNotify } from "./feed.js";
 
 const DB_NAME = "baby-tracker";
 const STORE = "kv";
@@ -148,19 +149,60 @@ export async function relink(state) {
 }
 
 /**
- * Прогноз окна следующего сна для Telegram-уведомления. Считается тут
- * же, где и для интерфейса (personal bias, sleep.js), — сервер прогноз
- * не пересчитывает, только хранит время и шлёт сообщение по расписанию.
- * null — явная отмена (ребёнок спит сейчас, или прогноз устарел/недоступен).
+ * Расписание уведомлений для Telegram. Считается здесь же, где и для
+ * интерфейса, — сервер прогноз не пересчитывает, только хранит время
+ * и готовый текст и шлёт его по расписанию.
+ *
+ * Значение по каждому виду: объект — поставить, null — снять явно
+ * (например, ребёнок уснул). Возврат null целиком означает «считать
+ * не из чего», и тогда сервер ничего не трогает.
  */
+
+/** Насколько близко два напоминания считаются одним шумом. */
+const NOTIFY_MERGE_MIN = 20;
+
 function computeNotify(state) {
   if (!state.profile?.birth) return null;
   const events = liveEvents(state.events || []);
+  const { birth, sex, name } = state.profile;
   const active = events.find((e) => e.type === "sleep" && !e.end);
-  if (active) return null;
-  const win = predictNext(events, state.profile.birth, Date.now(), state.bias || 0);
-  if (!win || win.stale) return null;
-  return { at: win.calm, fromLabel: hhmm(win.from), toLabel: hhmm(win.to) };
+
+  // ребёнок спит — оба напоминания снимаются: и укладывать уже не надо,
+  // и будить кормлением тем более
+  if (active) return { sleep: null, feed: null };
+
+  let sleepN = null;
+  const win = predictNext(events, birth, Date.now(), state.bias || 0);
+  if (win && !win.stale) {
+    sleepN = {
+      at: win.calm,
+      text: `🌙 Пора успокаиваться — окно сна ${hhmm(win.from)}–${hhmm(win.to)}`,
+    };
+  }
+
+  let feedN = null;
+  const f = feedNotify(events, birth, sex || null, Date.now());
+  if (f) {
+    const who = name ? `${name} ` : "";
+    const был = sex === "f" ? "ела" : "ел";
+    feedN = {
+      at: f.at,
+      text: `🍼 ${who}не ${был} ${durShort(f.sinceLabel * 60000)} — желудок свободен, ` +
+        "сейчас возьмёт охотнее всего",
+    };
+  }
+
+  /*
+   * Два напоминания подряд — это шум, а не забота. Если окно сна
+   * открывается почти одновременно с окном кормления, оставляем
+   * напоминание о сне: у него есть срок годности (перегул), а
+   * покормить можно и на десять минут позже.
+   */
+  if (sleepN && feedN && Math.abs(feedN.at - sleepN.at) < NOTIFY_MERGE_MIN * 60000) {
+    feedN = null;
+  }
+
+  return { sleep: sleepN, feed: feedN };
 }
 
 const stripLocal = (e) => ({
@@ -224,6 +266,9 @@ export async function syncOnce(state) {
       // sex мог прийти пустым от сервера, который ещё не обновлён, —
       // тогда сохраняем локальное значение, а не затираем его
       sex: data.profile.sex || profile?.sex || null,
+      // как и sex: сервер старой версии этого поля не пришлёт —
+      // тогда сохраняем локальный выбор, а не затираем его пустотой
+      notifyOff: data.profile.notifyOff || profile?.notifyOff || [],
       updatedAt: data.profile.updatedAt,
     };
     profileDirty = false;

@@ -150,3 +150,26 @@ button:focus-visible, input:focus-visible { outline: 2px solid #8a97e6; outline-
 .wrow-w { flex: 1.2; }
 .wrow-d { flex: 1; }
 .linkish { background: none; border: none; padding: 0; color: #8a97e6; font-size: 12px; cursor: pointer; }
+
+/* кормления */
+.bt-card.feed { border-color: #4a3a24; }
+.feed-head { display: flex; align-items: baseline; justify-content: space-between; }
+.feed-t { font-size: 13px; color: #e8a33d; font-weight: 500; }
+.feed-pct { font-size: 13px; color: #8a8299; }
+.feed-bar { position: relative; height: 6px; border-radius: 3px; background: #262232; overflow: hidden; margin-top: 10px; }
+.feed-fill { position: absolute; left: 0; top: 0; bottom: 0; background: #e8a33d; border-radius: 3px; }
+.feed-mark { position: absolute; top: -2px; bottom: -2px; width: 2px; background: #6f9e86; }
+
+/* переключатели уведомлений */
+.nprefs { margin-top: 6px; }
+.npref + .npref { margin-top: 14px; }
+.npref-b { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 10px; background: #252031; border: 1px solid #342f45; color: #9b93b3; border-radius: 12px; padding: 12px 14px; cursor: pointer; }
+.npref-b.on { border-color: #e8a33d; background: #2a2233; }
+.npref-l { font-size: 14px; color: #ded7f0; }
+.npref-b.on .npref-l { color: #e8a33d; }
+.npref-s { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: #6f677f; }
+
+/* разделы верхнего уровня */
+.seg { display: flex; gap: 4px; background: #1b1826; border: 1px solid #2b2739; border-radius: 13px; padding: 4px; margin-bottom: 14px; }
+.seg-b { flex: 1; background: none; border: none; color: #7d7593; border-radius: 10px; padding: 9px 0; font-size: 14px; cursor: pointer; }
+.seg-b.on { background: #2b2739; color: #ede6ff; }

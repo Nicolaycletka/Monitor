@@ -13,10 +13,10 @@ import {
   getEvent,
   upsertEvent,
   pruneDeleted,
-  getNotifyState,
-  setNotify,
-  clearNotify,
-  markNotifySent,
+  getNotification,
+  setNotification,
+  clearNotification,
+  markNotificationSent,
   dueNotifications,
   lastSleepEvent,
   linkTelegramChat,
@@ -92,10 +92,13 @@ const clean = (e, householdId, rev) => ({
   household_id: householdId,
   id: String(e.id).slice(0, 64),
   // illness — период болезни: данные за него не идут в обучение прогноза.
-  // weight — взвешивание, meta.g в граммах.
+  // weight — взвешивание, meta.g в граммах;
+  // length — длина тела лёжа, head — окружность головы, meta.mm в мм.
   // Неизвестные типы падают в "feed" молча, поэтому список нужно
   // расширять ОДНОВРЕМЕННО с клиентом, иначе записи тихо испортятся.
-  type: ["sleep", "feed", "diaper", "illness", "weight"].includes(e.type) ? e.type : "feed",
+  type: ["sleep", "feed", "diaper", "illness", "weight", "length", "head"].includes(e.type)
+    ? e.type
+    : "feed",
   start: Number(e.start) || 0,
   finish: e.end == null ? null : Number(e.end),
   meta: e.meta ? JSON.stringify(e.meta).slice(0, 500) : null,
@@ -113,6 +116,47 @@ const toClient = (r) => ({
   deleted: !!r.deleted,
   updatedAt: r.updated_at,
 });
+
+/** Виды уведомлений, известные серверу. Нужен только для валидации. */
+const KINDS = ["sleep", "feed"];
+
+/** Одно уведомление: null — снять, объект — поставить. */
+function putNotify(hid, kind, n) {
+  if (n === null) return clearNotification.run(hid, kind);
+  if (!n || !Number.isFinite(n.at)) return;
+  const at = Math.round(n.at);
+  const now = Date.now();
+  // отбрасываем совсем старые (часы уехали) или неправдоподобно
+  // далёкие метки — не даём битым клиентским данным что-то сломать
+  if (at <= now - 5 * 60000 || at >= now + 12 * 3600000) return;
+  const current = getNotification.get(hid, kind);
+  if (current && current.at === at) return; // уже стоит, не сбрасываем sent
+  setNotification.run({
+    id: hid,
+    kind,
+    at,
+    text: String(n.text || "").slice(0, 300),
+  });
+}
+
+function applyNotify(hid, notify) {
+  if (notify === undefined) return; // клиент ничего не пересчитывал
+  if (notify === null) {
+    for (const k of KINDS) clearNotification.run(hid, k);
+    return;
+  }
+  // старая форма: плоский объект с at/fromLabel/toLabel
+  if (Number.isFinite(notify.at)) {
+    putNotify(hid, "sleep", {
+      at: notify.at,
+      text: `🌙 Пора успокаиваться — окно сна ${notify.fromLabel}–${notify.toLabel}`,
+    });
+    return;
+  }
+  for (const k of KINDS) {
+    if (k in notify) putNotify(hid, k, notify[k]);
+  }
+}
 
 r.post("/api/sync", throttle, auth, (req, res) => {
   const hid = req.household.id;
@@ -139,43 +183,31 @@ r.post("/api/sync", throttle, auth, (req, res) => {
         name: String(profile.name || "").slice(0, 60),
         birth: Number(profile.birth) || null,
         sex: profile.sex === "m" || profile.sex === "f" ? profile.sex : null,
+        notify_off: Array.isArray(profile.notifyOff)
+          ? profile.notifyOff.filter((k) => KINDS.includes(k)).join(",")
+          : null,
         updated_at: Number(profile.updatedAt),
       });
     }
 
     /*
-     * Прогноз окна сна приходит от клиента (там же, где он и считается,
-     * с личной поправкой) — сервер сам ничего не прогнозирует, только
-     * хранит время следующего уведомления и шлёт его по расписанию.
-     * notify === null -> отменить (например, ребёнок снова уснул);
-     * notify === undefined -> клиент ничего не пересчитывал, не трогаем.
+     * Расписание уведомлений приходит от клиента — там же, где
+     * считается прогноз (с личной поправкой и весом). Сервер сам
+     * ничего не прогнозирует, только хранит время и текст.
+     *
+     * Принимаются две формы. Новая: { sleep: {...}|null, feed: {...}|null }.
+     * Старая: { at, fromLabel, toLabel } — так шлёт телефон, на
+     * котором приложение ещё не обновилось. Без поддержки старой
+     * формы напоминания о сне на нём молча перестали бы приходить.
      */
-    if (req.body?.notify === null) {
-      clearNotify.run({ id: hid });
-    } else if (req.body?.notify && Number.isFinite(req.body.notify.at)) {
-      const at = Math.round(req.body.notify.at);
-      const now = Date.now();
-      // отбрасываем совсем старые (часы уехали) или неправдоподобно
-      // далёкие метки — не даём битым клиентским данным что-то сломать
-      if (at > now - 5 * 60000 && at < now + 6 * 3600000) {
-        const current = getNotifyState.get(hid);
-        if (!current || current.notify_at !== at) {
-          setNotify.run({
-            id: hid,
-            at,
-            from_label: String(req.body.notify.fromLabel || "").slice(0, 16),
-            to_label: String(req.body.notify.toLabel || "").slice(0, 16),
-          });
-        }
-      }
-    }
+    applyNotify(hid, req.body?.notify);
   });
 
   apply();
 
   const rows = eventsSince.all(hid, since);
   const current = db
-    .prepare("SELECT name, birth, sex, profile_updated_at FROM households WHERE id = ?")
+    .prepare("SELECT name, birth, sex, notify_off, profile_updated_at FROM households WHERE id = ?")
     .get(hid);
 
   res.json({
@@ -185,6 +217,7 @@ r.post("/api/sync", throttle, auth, (req, res) => {
       name: current.name,
       birth: current.birth,
       sex: current.sex || null,
+      notifyOff: current.notify_off ? current.notify_off.split(",") : [],
       updatedAt: current.profile_updated_at,
     },
     serverTime: Date.now(),
@@ -274,21 +307,20 @@ if (telegramEnabled()) {
 
   setInterval(async () => {
     const due = dueNotifications.all(Date.now());
-    for (const hh of due) {
+    for (const n of due) {
       // помечаем сразу, чтобы сбой отправки не привёл к повтору на
       // следующем тике планировщика
-      markNotifySent.run(hh.id);
+      markNotificationSent.run(n.id, n.kind);
 
-      // защитный чек: если ребёнок уже уснул после того, как клиент
-      // прислал этот прогноз (клиент обычно сам шлёт notify:null в этом
-      // случае, но это на случай, если синк не успел или разошёлся)
-      const last = lastSleepEvent.get(hh.id);
+      // защитный чек: ребёнок уже спит. Будить его напоминанием —
+      // худшее, что это приложение может сделать, поэтому проверка
+      // общая для всех видов, а не только для сна.
+      const last = lastSleepEvent.get(n.id);
       if (last && last.finish === null) continue;
 
-      const chats = telegramChatsFor.all(hh.id);
+      const chats = telegramChatsFor.all(n.id);
       if (!chats.length) continue;
-      const text = `🌙 Пора успокаиваться — окно сна ${hh.notify_from_label}–${hh.notify_to_label}`;
-      for (const c of chats) await sendMessage(c.chat_id, text);
+      for (const c of chats) await sendMessage(c.chat_id, n.text);
     }
   }, 30000).unref();
 }

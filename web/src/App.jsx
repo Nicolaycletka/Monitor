@@ -11,10 +11,59 @@ import {
   inviteLink, readJoinToken, API, relink, fetchTelegramLink, MANUAL_BIAS_LIMIT,
 } from "./store.js";
 import {
-  SEX_LABEL, SEX_GEN, DAYS_PER_MONTH, MAX_DAYS, inRange, zOf, kgAt, medianKg,
-  pctText, weightPoints, gainRate, zTrend, parseWeight, kgText,
-  GAIN_MIN_DAYS, Z_DROP_ALARM,
+  IND, IND_KEYS, SEX_LABEL, SEX_GEN, DAYS_PER_MONTH, maxDays, inRange,
+  zOf, valueAt, medianOf, pctText, measurements, gainRate, zTrend,
+  parseValue, valueText, GAIN_MIN_DAYS, Z_DROP_ALARM,
 } from "./growth.js";
+import {
+  predictFeed, perFeedMl, isDaytime, HALF_LIFE, READY_FRACTION,
+} from "./feed.js";
+
+/**
+ * Как мерить — по одной подсказке на показатель. Для длины и головы
+ * это не формальность: домашняя погрешность здесь сопоставима с самой
+ * величиной, которую мы отслеживаем (см. MEASURE_NOTE ниже).
+ */
+const MEASURE_HINT = {
+  weight: "Можно ввести и граммы — 6350 поймётся так же, как 6,35. Взвешивайте в одно и то же время и в одинаковом виде (лучше голышом, до кормления): домашние весы дают ±20–50 г, а полный подгузник — все 200.",
+  length: "Можно ввести и миллиметры — 614 поймётся так же, как 61,4. Длину меряют лёжа: ребёнок на ровной поверхности, макушка у неподвижного упора, ноги выпрямлены. Одному это сделать почти невозможно — нужен второй человек.",
+  head: "Можно ввести и миллиметры — 402 поймётся так же, как 40,2. Лента идёт по самой широкой части: над бровями и через самый выступающий затылочный бугор. Меряют трижды и берут наибольшее.",
+};
+
+/** Оговорка о точности — своя у каждого показателя, и разная по силе. */
+const MEASURE_NOTE = {
+  weight: "Ежедневное взвешивание дома почти всегда даёт больше тревоги, чем смысла: разброс между двумя измерениями подряд сопоставим с недельной прибавкой. Раз в неделю-две достаточно.",
+  length: "Здесь стоит быть особенно осторожным с домашними цифрами. Разброс длины у трёхмесячных — около 2 см на одну z-оценку, а ошибка измерения сантиметровой лентой на извивающемся ребёнке легко достигает того же сантиметра. То есть половина «изменения перцентиля» может оказаться тем, как в этот раз легли ноги. Цифрам с приёма у педиатра доверяйте больше, чем своим, и мерьте не чаще раза в месяц.",
+  head: "Разброс окружности головы у трёхмесячных — около 1.2 см на одну z-оценку, а расхождение между двумя обмерами лентой подряд бывает в полсантиметра. Поэтому меряют трижды и берут наибольшее, а выводы делают по цифрам с приёма, а не по домашним.",
+};
+
+/**
+ * Два раздела верхнего уровня, у каждого свой набор нижних вкладок.
+ * Разделение не косметическое: «Сон» — это то, что смотрят по
+ * несколько раз в день, «Здоровье» — то, что открывают раз в неделю.
+ * Держать их в одном ряду значило заставлять часто нажимаемое
+ * соседствовать с редким.
+ *
+ * Вторая вкладка раздела «Сон» называется «День», а не «Сегодня»:
+ * она листается стрелками на любую прошлую дату, и «Сегодня» было бы
+ * обещанием, которого экран не выполняет.
+ */
+const SECTIONS = {
+  sleep: {
+    label: "Сон",
+    tabs: [["now", "Сейчас"], ["day", "День"], ["week", "Неделя"]],
+  },
+  health: {
+    label: "Здоровье",
+    tabs: IND_KEYS.map((k) => [k, IND[k].tab]),
+  },
+};
+
+/** Виды уведомлений: ключ, подпись, пояснение. */
+const NOTIFY_KINDS = [
+  ["sleep", "Пора укладывать", "Приходит в начале фазы успокоения, по прогнозу окна сна."],
+  ["feed", "Можно кормить", "Приходит, когда желудок освободился и прошёл обычный для ребёнка промежуток. Только днём, с 7 до 22."],
+];
 
 const FEED_LABEL = {
   left: "ГВ, левая", right: "ГВ, правая", formula: "Смесь",
@@ -34,15 +83,15 @@ const eventTitle = (e) =>
     ? DIAPER_LABEL[e.meta?.kind] || "Подгузник"
     : e.type === "illness"
     ? "Болезнь"
-    : e.type === "weight"
-    ? `Вес · ${kgText(e.meta?.g || 0)} кг`
+    : IND[e.type]
+    ? `${IND[e.type].title} · ${valueText(IND[e.type], e.meta[IND[e.type].metaKey] || 0)} ${IND[e.type].unit}`
     : e.type;
 
 const eventColor = (e) =>
   e.type === "sleep" ? "#6c7bd9"
     : e.type === "feed" ? "#e8a33d"
     : e.type === "illness" ? "#c46a5a"
-    : e.type === "weight" ? "#b98ad9"
+    : IND[e.type] ? IND[e.type].color
     : "#5f9e86";
 
 /**
@@ -59,6 +108,7 @@ const noonOf = (isoStr) => {
 
 export default function App() {
   const [state, setState] = useState(null);
+  const [section, setSection] = useState("sleep");
   const [tab, setTab] = useState("now");
   const [tick, setTick] = useState(Date.now());
   const [toast, setToast] = useState(null);
@@ -245,12 +295,16 @@ export default function App() {
 
   const shift = (ev, field, mins) => putEvent({ ...ev, [field]: ev[field] + mins * MIN });
 
-  /* ---------- вес ---------- */
+  /* ---------- антропометрия ---------- */
 
-  const addWeight = (grams, ts) => {
-    const ev = { id: uid(), type: "weight", start: ts, end: ts, meta: { g: grams } };
+  const addMeasure = (ind, value, ts) => {
+    const ev = {
+      id: uid(), type: ind.key, start: ts, end: ts,
+      meta: { [ind.metaKey]: value },
+    };
     putEvent(ev);
-    flash(`Вес ${kgText(grams)} кг`, () => putEvent({ ...ev, deleted: true }));
+    flash(`${ind.title} ${valueText(ind, value)} ${ind.unit}`,
+      () => putEvent({ ...ev, deleted: true }));
     setTimeout(runSync, 800);
   };
 
@@ -311,6 +365,24 @@ export default function App() {
           <span className="bt-name">{profile.name}</span>
           <span className="bt-age">{ageText(profile.birth, tick)}</span>
         </header>
+
+        <div className="seg">
+          {Object.entries(SECTIONS).map(([k, sec]) => (
+            <button
+              key={k}
+              className={"seg-b" + (section === k ? " on" : "")}
+              onClick={() => {
+                // переключая раздел, всегда открываем его первую вкладку:
+                // иначе экран остался бы от прошлого раздела и нижние
+                // кнопки показывали бы не то, что открыто
+                setSection(k);
+                setTab(sec.tabs[0][0]);
+              }}
+            >
+              {sec.label}
+            </button>
+          ))}
+        </div>
 
         {tab === "now" && (
           <>
@@ -395,6 +467,8 @@ export default function App() {
               </div>
             )}
 
+            <FeedNote events={events} profile={profile} now={tick} />
+
             <Kpis stats={dayStats(events, todayStart)} title="Сегодня" />
           </>
         )}
@@ -403,9 +477,9 @@ export default function App() {
           <DayView events={events} offset={offset} setOffset={setOffset} onPick={setEditing} />
         )}
 
-        {tab === "weight" && (
-          <WeightView profile={profile} events={events} now={tick}
-            onAdd={addWeight} onSex={setSex} onPick={setEditing} />
+        {IND[tab] && (
+          <MeasureView ind={IND[tab]} profile={profile} events={events} now={tick}
+            onAdd={addMeasure} onSex={setSex} onPick={setEditing} />
         )}
 
         {tab === "week" && (
@@ -434,9 +508,12 @@ export default function App() {
             const cur = events.find((e) => e.id === editing.id);
             if (cur) putEvent({ ...cur, meta: { ...cur.meta, ml: Math.max(0, (cur.meta?.ml || 0) + d) } });
           }}
-          onGrams={(d) => {
+          onValue={(d) => {
             const cur = events.find((e) => e.id === editing.id);
-            if (cur) putEvent({ ...cur, meta: { ...cur.meta, g: Math.max(500, (cur.meta?.g || 0) + d) } });
+            const ind = cur && IND[cur.type];
+            if (!ind) return;
+            const next = Math.min(Math.max((cur.meta?.[ind.metaKey] || 0) + d, ind.min), ind.max);
+            putEvent({ ...cur, meta: { ...cur.meta, [ind.metaKey]: next } });
           }}
           onDays={(d) => {
             const cur = events.find((e) => e.id === editing.id);
@@ -455,7 +532,7 @@ export default function App() {
 
       <nav className="tabs">
         <div className="tabs-in">
-          {[["now", "Сейчас"], ["day", "День"], ["weight", "Вес"], ["week", "Неделя"]].map(([k, l]) => (
+          {SECTIONS[section].tabs.map(([k, l]) => (
             <button key={k} className={"tab" + (tab === k ? " on" : "")} onClick={() => setTab(k)}>{l}</button>
           ))}
         </div>
@@ -1116,13 +1193,19 @@ function WeekView({ state, events, update, onSaveIllness, onRemoveIllness }) {
         </button>
       </div>
 
+      <div className="sec">Кормления</div>
+      <FeedModelCard state={state} events={events} />
+
       <div className="sec">Уведомления в Telegram</div>
       <div className="bt-card">
         <p className="hint" style={{ marginTop: 0 }}>
-          Бот пришлёт сообщение, когда пора укладывать — по тому же прогнозу,
-          что и на вкладке «Сейчас». Откройте ссылку в Telegram на телефоне
-          каждого родителя, кто хочет получать напоминания.
+          Бот пришлёт сообщение по тому же расчёту, что показан на вкладке
+          «Сейчас». Откройте ссылку в Telegram на телефоне каждого родителя,
+          кто хочет получать напоминания.
         </p>
+
+        <NotifyPrefs state={state} update={update} />
+
         {tgLink ? (
           <a className="sact ghost full" href={tgLink} target="_blank" rel="noreferrer">
             Открыть бота
@@ -1167,38 +1250,252 @@ function WeekView({ state, events, update, onSaveIllness, onRemoveIllness }) {
   );
 }
 
+/**
+ * Переключатели видов уведомлений.
+ *
+ * Настройка общая на семью, а не на телефон: она едет через профиль
+ * тем же LWW-механизмом, что имя и дата рождения, и второй родитель
+ * получает её при ближайшей синхронизации. Раздельная настройка на
+ * каждого родителя потребовала бы привязки к chat_id — это другая
+ * задача, и пока непонятно, нужна ли она.
+ *
+ * Хранится список ОТКЛЮЧЁННЫХ видов: тогда вид, добавленный в будущей
+ * версии, заработает сам, а не окажется молча выключенным.
+ */
+function NotifyPrefs({ state, update }) {
+  const off = state.profile?.notifyOff || [];
+  const toggle = (kind) =>
+    update((st) => {
+      const cur = st.profile?.notifyOff || [];
+      const next = cur.includes(kind) ? cur.filter((k) => k !== kind) : [...cur, kind];
+      return {
+        ...st,
+        profile: { ...st.profile, notifyOff: next, updatedAt: Date.now() },
+        profileDirty: true,
+      };
+    });
+
+  return (
+    <div className="nprefs">
+      {NOTIFY_KINDS.map(([kind, label, hint]) => {
+        const on = !off.includes(kind);
+        return (
+          <div className="npref" key={kind}>
+            <button
+              className={"npref-b" + (on ? " on" : "")}
+              onClick={() => toggle(kind)}
+              role="switch"
+              aria-checked={on}
+            >
+              <span className="npref-l">{label}</span>
+              <span className="npref-s">{on ? "включено" : "выключено"}</span>
+            </button>
+            <p className="hint" style={{ marginTop: 6 }}>{hint}</p>
+          </div>
+        );
+      })}
+      {off.length === NOTIFY_KINDS.length && (
+        <p className="hint">
+          Выключено всё — бот останется привязанным, но писать не будет.
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** Что именно приложение считает про кормления и на каких числах. */
+function FeedModelCard({ state, events }) {
+  const { birth, sex } = state.profile;
+  const t = perFeedMl(events, birth, sex || null, Date.now());
+  const p = predictFeed(events, birth, sex || null, Date.now());
+
+  if (!t) {
+    return (
+      <div className="bt-card">
+        <p className="hint" style={{ marginTop: 0 }}>
+          Чтобы считать объём кормления, нужен вес: укажите пол на вкладке
+          «Вес» или запишите взвешивание.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="bt-card">
+      <div className="field">
+        <span className="field-l">Суточный объём по возрасту</span>
+        <span className="field-v bt-num">{Math.round(t.daily)} мл</span>
+      </div>
+      <div className="field">
+        <span className="field-l">Кормлений в сутки (медиана)</span>
+        <span className="field-v bt-num">{t.feeds}</span>
+      </div>
+      <div className="field">
+        <span className="field-l">Отсюда объём кормления</span>
+        <span className="field-v bt-num">≈{Math.round(t.ml)} мл</span>
+      </div>
+      {p && !p.empty && p.interval != null && (
+        <div className="field">
+          <span className="field-l">Свой промежуток между кормлениями</span>
+          <span className="field-v bt-num">{Math.round(p.interval)} мин</span>
+        </div>
+      )}
+
+      <p className="hint">
+        Приложение не предсказывает голод — оно считает, освободился ли
+        желудок. Это разные вещи: голод зависит не только от того, пусто ли
+        в желудке. Поэтому формулировка везде «можно кормить», а не «пора»,
+        и кормление по требованию она не заменяет.
+      </p>
+      <p className="hint">
+        Опорожнение желудка считается экспоненциальным, период
+        полувыведения — {HALF_LIFE.breast} мин для грудного молока
+        и {HALF_LIFE.formula} мин для смеси (дыхательный тест
+        с 13C-октановой кислотой у доношенных). Разброс в исходном
+        исследовании огромный, 16–86 и 27–98 минут, так что расчёт даёт
+        порядок величины, а не минуты.
+      </p>
+      <p className="hint">
+        Объём кормления для груди никто не измеряет — это главная слабость
+        расчёта. Он выводится из суточного объёма по возрасту
+        ({t.measured ? "вес взят из последнего взвешивания" : "вес подставлен как медиана ВОЗ — запишите взвешивание, и он станет вашим"}),
+        делённого на ваше собственное число кормлений. Для смеси берётся
+        введённый объём.
+      </p>
+      <p className="hint">
+        Пропуск в записях сам по себе ничего не значит. Но если промежуток
+        закрыт отмеченным сном, приложение знает, что ребёнок не ел, —
+        и считает промежуток настоящим. Длинный промежуток без сна и без
+        записей считается дыркой в дневнике, и напоминание тогда
+        не приходит.
+      </p>
+      <p className="hint">
+        Через три часа от прошлого кормления в желудке остаётся около
+        десятой части — поэтому расчёт «забывает» пропущенный кусок дня
+        сам собой, и одного отмеченного кормления хватает, чтобы он снова
+        стал осмысленным.
+      </p>
+      <p className="hint">
+        Обучения на собственных подсказках здесь нет намеренно: иначе
+        вышла бы та же петля, что с окнами сна — приложение предложило
+        время, вы покормили, приложение посчитало собственный сдвиг
+        фактом о ребёнке.
+      </p>
+    </div>
+  );
+}
+
+/**
+ * Состояние кормления на вкладке «Сейчас».
+ *
+ * Формулировки намеренно разрешительные: «можно», а не «пора».
+ * Приложение не знает, голоден ли ребёнок, — оно знает только,
+ * освободился ли желудок. Кормление по требованию этим подменять
+ * нельзя, и сигналы ребёнка точнее любого расчёта.
+ */
+function FeedNote({ events, profile, now }) {
+  const p = predictFeed(events, profile.birth, profile.sex || null, now);
+  if (!p) return null;
+
+  if (p.empty) {
+    return (
+      <div className="bt-card feed" style={{ marginTop: 12 }}>
+        <div className="feed-t">Кормления</div>
+        <p className="hint" style={{ marginTop: 6 }}>
+          Отметьте хотя бы одно кормление — дальше приложение будет считать,
+          когда желудок освободится.
+        </p>
+      </div>
+    );
+  }
+
+  const pct = Math.round(p.fill * 100);
+
+  return (
+    <div className="bt-card feed" style={{ marginTop: 12 }}>
+      <div className="feed-head">
+        <span className="feed-t">
+          {p.asleep
+            ? "Спит — кормление подождёт"
+            : p.readyNow
+            ? "Можно кормить"
+            : `Можно кормить с ${hhmm(p.readyAt)}`}
+        </span>
+        <span className="feed-pct bt-num">{pct}%</span>
+      </div>
+      <div className="feed-bar">
+        <div className="feed-fill" style={{ width: `${pct}%` }} />
+        <div className="feed-mark" style={{ left: `${Math.round(READY_FRACTION * 100)}%` }} />
+      </div>
+      <div className="win-text bt-num" style={{ marginTop: 8 }}>
+        Последнее кормление в {hhmm(p.lastFeed.start)} · {durShort(p.gapMin * MIN)} назад
+      </div>
+
+      {p.stale ? (
+        <p className="hint">
+          Прошло {durShort(p.gapMin * MIN)}, и почти всё это время ребёнок не спал.
+          Похоже, кормления просто не отмечены — напоминание в этом случае
+          не приходит, чтобы не будить вас из-за дырки в дневнике. Отметьте
+          ближайшее кормление, и расчёт восстановится за пару часов.
+        </p>
+      ) : p.nightly ? (
+        <p className="hint">
+          Следующее напоминание пришлось бы на ночь — ночью приложение
+          не пишет. Ночные кормления по требованию и без подсказок.
+        </p>
+      ) : p.asleep ? (
+        <p className="hint">
+          Пока ребёнок спит, напоминание о кормлении не придёт: будить его
+          пушем — худшее, что приложение может сделать.
+        </p>
+      ) : (
+        <p className="hint">
+          {p.readyNow
+            ? "Желудок освободился. Это не значит «пора» — это значит, что ребёнок сейчас скорее возьмёт, чем откажется."
+            : `Сейчас в желудке примерно ${Math.round(p.level)} мл. Раньше этого времени ребёнок, скорее всего, возьмёт меньше обычного.`}
+          {" "}Напоминание в Telegram — в {hhmm(p.dueAt)}.
+        </p>
+      )}
+    </div>
+  );
+}
+
 /* ================================================================== */
-/*  Вес                                                                */
+/*  Антропометрия: вес, длина, окружность головы                       */
 /* ================================================================== */
 
 /**
- * Кривые ВОЗ и точки ребёнка. Рисуется по узлам таблицы, без
- * сглаживания: кривая веса-к-возрасту и так гладкая, а ломаная по
- * 64 точкам на экране телефона неотличима от гладкой.
+ * Кривые ВОЗ и точки ребёнка. Один компонент на все три показателя:
+ * различаются они только таблицей, единицами и шагом сетки, а это
+ * всё лежит в описании показателя (IND).
+ *
+ * Рисуется по узлам без сглаживания: кривые ВОЗ и так гладкие, а
+ * ломаная по 64 точкам на экране телефона неотличима от гладкой.
  */
-function GrowthChart({ sex, points, ageDays }) {
+function GrowthChart({ ind, sex, points, ageDays }) {
   const W = 340, H = 208, padL = 30, padR = 26, padT = 10, padB = 20;
   const lastDay = points.length ? points[points.length - 1].days : 0;
-  const xMax = Math.min(MAX_DAYS, Math.max(120, ageDays * 1.15, lastDay + 10));
+  const top = maxDays(ind);
+  const xMax = Math.min(top, Math.max(120, ageDays * 1.15, lastDay + 10));
 
   const N = 64;
   const xs = Array.from({ length: N + 1 }, (_, i) => (xMax * i) / N);
   const zLines = [-3, -2, -1, 0, 1, 2, 3];
-  const curves = zLines.map((z) => xs.map((d) => kgAt(sex, d, z)));
+  const curves = zLines.map((z) => xs.map((d) => valueAt(ind, sex, d, z)));
 
   let yLo = Math.min(...curves[0]);
   let yHi = Math.max(...curves[6]);
   for (const p of points) {
     if (p.days < 0 || p.days > xMax) continue;
-    yLo = Math.min(yLo, p.kg);
-    yHi = Math.max(yHi, p.kg);
+    yLo = Math.min(yLo, p.value);
+    yHi = Math.max(yHi, p.value);
   }
   const pad = (yHi - yLo) * 0.04;
   yLo -= pad;
   yHi += pad;
 
   const x = (d) => padL + (d / xMax) * (W - padL - padR);
-  const y = (kg) => H - padB - ((kg - yLo) / (yHi - yLo)) * (H - padT - padB);
+  const y = (v) => H - padB - ((v - yLo) / (yHi - yLo)) * (H - padT - padB);
 
   const pt = (vals) => vals.map((v, i) => `${x(xs[i])},${y(v)}`);
   const line = (vals) => pt(vals).join(" ");
@@ -1206,8 +1503,7 @@ function GrowthChart({ sex, points, ageDays }) {
   const band = (lo, hi) =>
     `M ${pt(curves[hi]).join(" L ")} L ${pt(curves[lo]).reverse().join(" L ")} Z`;
 
-  const range = yHi - yLo;
-  const yStep = range <= 5 ? 1 : range <= 11 ? 2 : range <= 22 ? 4 : 5;
+  const yStep = ind.ticks(yHi - yLo);
   const yTicks = [];
   for (let v = Math.ceil(yLo / yStep) * yStep; v <= yHi; v += yStep) yTicks.push(v);
 
@@ -1219,7 +1515,7 @@ function GrowthChart({ sex, points, ageDays }) {
 
   return (
     <svg className="chart" viewBox={`0 0 ${W} ${H}`} role="img"
-      aria-label="Кривая веса относительно стандартов ВОЗ">
+      aria-label={`${ind.title} относительно стандартов ВОЗ`}>
       <path d={band(0, 6)} fill="rgba(108,123,217,.07)" />
       <path d={band(1, 5)} fill="rgba(108,123,217,.11)" />
 
@@ -1247,56 +1543,66 @@ function GrowthChart({ sex, points, ageDays }) {
       ))}
 
       {own.length > 1 && (
-        <polyline points={own.map((p) => `${x(p.days)},${y(p.kg)}`).join(" ")}
-          fill="none" stroke="#e8a33d" strokeWidth="1.6"
+        <polyline points={own.map((p) => `${x(p.days)},${y(p.value)}`).join(" ")}
+          fill="none" stroke={ind.color} strokeWidth="1.6"
           strokeLinejoin="round" strokeLinecap="round" />
       )}
       {own.map((p, i) => (
-        <circle key={p.id} cx={x(p.days)} cy={y(p.kg)} r={i === own.length - 1 ? 3.2 : 2}
-          fill={i === own.length - 1 ? "#e8a33d" : "#14121c"}
-          stroke="#e8a33d" strokeWidth="1.4" />
+        <circle key={p.id} cx={x(p.days)} cy={y(p.value)} r={i === own.length - 1 ? 3.2 : 2}
+          fill={i === own.length - 1 ? ind.color : "#14121c"}
+          stroke={ind.color} strokeWidth="1.4" />
       ))}
     </svg>
   );
 }
 
 /**
- * Вкладка «Вес». Кривые — WHO Child Growth Standards (weight-for-age).
+ * Вкладка одного показателя: вес, длина тела или окружность головы.
+ * Кривые — WHO Child Growth Standards (weight-for-age,
+ * length-for-age, head-circumference-for-age).
  *
- * Осознанные решения, чтобы их потом не пересматривать вслепую:
+ * Осознанные решения, общие для всех трёх:
  *   - Показываются линии z-оценок (−3…+3), а не перцентильные кривые:
  *     считаем мы всё равно z, и рисовать одно, а считать другое —
  *     верный способ разойтись на округлениях.
- *   - Темп прибавки считается только по плечу от недели и длиннее,
- *     иначе погрешность домашних весов больше самой прибавки.
+ *   - Темп прироста считается только по плечу от недели и длиннее,
+ *     иначе погрешность измерения больше самого прироста.
  *   - Тревожная формулировка одна и мягкая. Приложение, которое
  *     пугает родителя трёхмесячного ребёнка по показаниям кухонных
- *     весов, приносит больше вреда, чем пользы.
+ *     весов и сантиметровой ленты, приносит больше вреда, чем пользы.
  */
-function WeightView({ profile, events, now, onAdd, onSex, onPick }) {
+function MeasureView({ ind, profile, events, now, onAdd, onSex, onPick }) {
   const [raw, setRaw] = useState("");
   const [date, setDate] = useState(() => toInput(Date.now()));
   const [err, setErr] = useState(null);
 
+  // при переключении вкладки поле должно очищаться, иначе введённые
+  // килограммы уедут в сантиметры соседнего показателя
+  useEffect(() => { setRaw(""); setErr(null); }, [ind.key]);
+
   const sex = profile.sex || null;
-  const pts = useMemo(() => weightPoints(events, profile.birth), [events, profile.birth]);
+  const pts = useMemo(
+    () => measurements(ind, events, profile.birth),
+    [ind, events, profile.birth]
+  );
   const ageDays = (now - profile.birth) / DAY;
   const last = pts.length ? pts[pts.length - 1] : null;
-  const lastZ = sex && last && inRange(last.days) ? zOf(sex, last.days, last.kg) : null;
-  const gain = useMemo(() => gainRate(pts, sex), [pts, sex]);
-  const trend = useMemo(() => zTrend(pts, sex), [pts, sex]);
+  const lastZ = sex && last && inRange(ind, last.days)
+    ? zOf(ind, sex, last.days, last.value) : null;
+  const gain = useMemo(() => gainRate(ind, pts, sex), [ind, pts, sex]);
+  const trend = useMemo(() => zTrend(ind, pts, sex), [ind, pts, sex]);
 
   const submit = () => {
-    const g = parseWeight(raw);
-    if (g == null) {
-      setErr("Не понял вес. Введите килограммы (6,35) или граммы (6350).");
+    const v = parseValue(ind, raw);
+    if (v == null) {
+      setErr(`Не понял значение. Введите ${ind.unit} (${ind.key === "weight" ? "6,35" : "61,4"}) или ${ind.stepUnit} (${ind.key === "weight" ? "6350" : "614"}).`);
       return;
     }
     const ts = noonOf(date);
     if (!Number.isFinite(ts)) { setErr("Неверная дата."); return; }
     if (ts < profile.birth - DAY) { setErr("Эта дата раньше дня рождения."); return; }
     if (ts > Date.now() + DAY) { setErr("Дата в будущем."); return; }
-    onAdd(g, ts);
+    onAdd(ind, v, ts);
     setRaw("");
     setErr(null);
   };
@@ -1307,9 +1613,9 @@ function WeightView({ profile, events, now, onAdd, onSex, onPick }) {
         <div className="sec" style={{ marginTop: 0 }}>Пол ребёнка</div>
         <div className="bt-card">
           <p className="hint" style={{ marginTop: 0 }}>
-            Кривые веса у мальчиков и девочек разные — к трём месяцам медианы
-            расходятся примерно на полкилограмма, это больше, чем весь разброс,
-            который вы будете отслеживать. Без пола график строить нечестно.
+            Кривые роста у мальчиков и девочек разные — к трём месяцам медианы
+            расходятся сильнее, чем весь разброс, который вы будете
+            отслеживать. Без пола график строить нечестно.
           </p>
           <div className="settle-row" style={{ marginTop: 12 }}>
             {["f", "m"].map((k) => (
@@ -1327,13 +1633,15 @@ function WeightView({ profile, events, now, onAdd, onSex, onPick }) {
     );
   }
 
+  const outOfRange = !inRange(ind, ageDays);
+
   return (
     <>
-      <div className="sec" style={{ marginTop: 0 }}>Записать взвешивание</div>
+      <div className="sec" style={{ marginTop: 0 }}>Записать {ind.what}</div>
       <div className="bt-card">
         <div className="wrow">
           <input className="inp wrow-w" value={raw} inputMode="decimal"
-            placeholder="кг, например 6,35"
+            placeholder={`${ind.unit}, например ${ind.key === "weight" ? "6,35" : "61,4"}`}
             onChange={(e) => { setRaw(e.target.value); setErr(null); }}
             onKeyDown={(e) => e.key === "Enter" && submit()} />
           <input className="inp wrow-d" type="date" value={date} max={toInput(Date.now())}
@@ -1341,37 +1649,39 @@ function WeightView({ profile, events, now, onAdd, onSex, onPick }) {
         </div>
         {err && <p className="hint err">{err}</p>}
         <button className="big sleep" onClick={submit}>Записать</button>
-        <p className="hint">
-          Можно ввести и граммы — 6350 поймётся так же, как 6,35. Взвешивайте
-          в одно и то же время и в одинаковом виде (лучше голышом, до
-          кормления): домашние весы дают ±20–50 г, а полный подгузник —
-          все 200.
-        </p>
+        <p className="hint">{MEASURE_HINT[ind.key]}</p>
       </div>
 
       <div className="sec">График</div>
       <div className="bt-card">
-        <GrowthChart sex={sex} points={pts} ageDays={ageDays} />
+        <GrowthChart ind={ind} sex={sex} points={pts} ageDays={ageDays} />
         <div className="chart-cap">
           <span>месяцы</span>
-          <span>кг · линии ВОЗ: −3 … 0 … +3 SD</span>
+          <span>{ind.unit} · линии ВОЗ: −3 … 0 … +3 SD</span>
         </div>
         {pts.length === 0 && (
           <p className="hint">
             Записей пока нет — показаны только кривые ВОЗ для {SEX_GEN[sex]}.
-            Первой точкой удобно поставить вес при рождении: выберите дату
-            рождения в поле выше.
+            {ind.key === "weight" && " Первой точкой удобно поставить вес при рождении: выберите дату рождения в поле выше."}
+          </p>
+        )}
+        {outOfRange && (
+          <p className="hint">
+            Таблица ВОЗ по этому показателю заканчивается
+            на {ind.maxMonths === 24 ? "двух годах" : "пяти годах"}
+            {ind.key === "length" && " — после двух лет рост измеряют стоя, и это уже другая величина"}.
+            Записи сохраняются, перцентиль дальше не считается.
           </p>
         )}
       </div>
 
       {last && (
         <>
-          <div className="sec">Последнее взвешивание</div>
+          <div className="sec">Последнее {ind.what}</div>
           <div className="kpi">
             <div>
-              <div className="kpi-v bt-num">{kgText(last.g)}</div>
-              <div className="kpi-l">кг · {dayLabel(last.ts)}</div>
+              <div className="kpi-v bt-num">{valueText(ind, last.raw)}</div>
+              <div className="kpi-l">{ind.unit} · {dayLabel(last.ts)}</div>
             </div>
             <div>
               <div className="kpi-v bt-num">{lastZ == null ? "—" : pctText(lastZ)}</div>
@@ -1379,22 +1689,24 @@ function WeightView({ profile, events, now, onAdd, onSex, onPick }) {
             </div>
             <div>
               <div className="kpi-v bt-num">
-                {inRange(last.days) ? medianKg(sex, last.days).toFixed(2).replace(".", ",") : "—"}
+                {inRange(ind, last.days)
+                  ? medianOf(ind, sex, last.days).toFixed(ind.key === "weight" ? 2 : 1).replace(".", ",")
+                  : "—"}
               </div>
               <div className="kpi-l">медиана ВОЗ на тот возраст</div>
             </div>
             <div>
               <div className="kpi-v bt-num">
-                {gain ? `${gain.gramsPerDay > 0 ? "+" : ""}${Math.round(gain.gramsPerDay)}` : "—"}
+                {gain ? `${gain.perWeek > 0 ? "+" : ""}${Math.round(gain.perWeek)}` : "—"}
               </div>
-              <div className="kpi-l">г в сутки</div>
+              <div className="kpi-l">{ind.stepUnit === "граммы" ? "г" : "мм"} в неделю</div>
             </div>
           </div>
 
           {lastZ != null && (
             <p className="hint">
-              Из ста детей того же возраста и пола примерно <b>{pctText(lastZ)}</b> весят
-              меньше{Math.abs(lastZ) > 3 ? " (у самого края таблицы это уже грубая оценка)" : ""}.
+              Из ста детей того же возраста и пола примерно <b>{pctText(lastZ)}</b> имеют
+              значение меньше{Math.abs(lastZ) > 3 ? " (у самого края таблицы это уже грубая оценка)" : ""}.
               Сам по себе перцентиль ничего не значит: тридцатый — такая же норма,
               как семидесятый. Значение имеет только то, держится он или ползёт.
             </p>
@@ -1403,26 +1715,26 @@ function WeightView({ profile, events, now, onAdd, onSex, onPick }) {
           {gain && (
             <p className="hint">
               С {dayLabel(gain.from.ts)} по {dayLabel(gain.to.ts)} ({Math.round(gain.days)} дн)
-              прибавка <b>{gain.grams > 0 ? "+" : ""}{gain.grams} г</b>, это{" "}
-              <b>{Math.round(gain.gramsPerDay)} г в сутки</b>.
-              {gain.refGramsPerDay != null && (
-                <> Медиана ВОЗ за тот же отрезок растёт на {Math.round(gain.refGramsPerDay)} г
-                в сутки.</>
+              прирост <b>{gain.delta > 0 ? "+" : ""}{gain.delta} {ind.stepUnit === "граммы" ? "г" : "мм"}</b>,
+              это <b>{Math.round(gain.perWeek)} {ind.stepUnit === "граммы" ? "г" : "мм"} в неделю</b>.
+              {gain.refPerWeek != null && (
+                <> Медиана ВОЗ за тот же отрезок растёт
+                на {Math.round(gain.refPerWeek)} {ind.stepUnit === "граммы" ? "г" : "мм"} в неделю.</>
               )}{" "}
-              Это разность медиан, а не отдельный стандарт скорости прибавки —
+              Это разность медиан, а не отдельный стандарт скорости прироста —
               такой у ВОЗ есть, считается иначе и по коротким отрезкам обычно
-              шире. Сравнивайте порядок величины, а не десятки граммов.
+              шире. Сравнивайте порядок величины, а не единицы.
             </p>
           )}
           {!gain && pts.length >= 2 && (
             <p className="hint">
-              Темп прибавки посчитается, когда между взвешиваниями наберётся
-              {" "}{GAIN_MIN_DAYS} дней. На более коротком плече погрешность весов
-              больше самой прибавки, и цифра будет случайной.
+              Темп прироста посчитается, когда между измерениями наберётся
+              {" "}{GAIN_MIN_DAYS} дней. На более коротком плече погрешность измерения
+              больше самого прироста, и цифра будет случайной.
             </p>
           )}
 
-          {ageDays < 21 && (
+          {ind.key === "weight" && ageDays < 21 && (
             <p className="hint">
               Первые дни ребёнок теряет вес — до 7–10 % от веса при рождении,
               и возвращается к нему обычно к 10–14 дню. На графике это выглядит
@@ -1431,35 +1743,37 @@ function WeightView({ profile, events, now, onAdd, onSex, onPick }) {
             </p>
           )}
 
-          {trend && trend.drop >= Z_DROP_ALARM && trend.span >= 14 && (
+          {trend && trend.shift >= Z_DROP_ALARM && trend.span >= 14 && (
             <div className="bt-card sick" style={{ marginTop: 12 }}>
-              <div className="sick-t">Коридор сместился вниз</div>
+              <div className="sick-t">
+                Коридор сместился {trend.dir === "up" ? "вверх" : "вниз"}
+              </div>
               <p className="hint" style={{ marginTop: 6 }}>
-                С {dayLabel(trend.peak.ts)} перцентиль опустился
-                с {pctText(trend.peak.z)} до {pctText(trend.last.z)}. Смещение
+                С {dayLabel(trend.from.ts)} перцентиль {trend.dir === "up" ? "поднялся" : "опустился"}
+                {" "}с {pctText(trend.from.z)} до {pctText(trend.last.z)}. Смещение
                 на такую величину — повод показать цифры педиатру на ближайшем
-                приёме, а не повод для выводов: на домашних весах его может дать
-                и другое время взвешивания, и просто индивидуальная траектория.
-                Приложение ничего не диагностирует.
+                приёме, а не повод для выводов: его может дать и другая техника
+                измерения, и просто индивидуальная траектория. Приложение ничего
+                не диагностирует.
               </p>
             </div>
           )}
         </>
       )}
 
-      <div className="sec">Все взвешивания</div>
+      <div className="sec">Все записи</div>
       <div className="bt-card list">
         {pts.length === 0 ? (
           <div className="empty">Записей нет.</div>
         ) : (
           pts.slice().reverse().map((p) => {
-            const z = inRange(p.days) ? zOf(sex, p.days, p.kg) : null;
+            const z = inRange(ind, p.days) ? zOf(ind, sex, p.days, p.value) : null;
             return (
               <button className="row" key={p.id}
                 onClick={() => onPick(events.find((e) => e.id === p.id))}>
-                <span className="dot" style={{ background: "#b98ad9" }} />
+                <span className="dot" style={{ background: ind.color }} />
                 <span className="row-main">
-                  <span className="row-t">{kgText(p.g)} кг</span>
+                  <span className="row-t">{valueText(ind, p.raw)} {ind.unit}</span>
                   <span className="row-s bt-num">
                     {dayLabel(p.ts)} · {ageText(profile.birth, p.ts)}
                   </span>
@@ -1470,27 +1784,24 @@ function WeightView({ profile, events, now, onAdd, onSex, onPick }) {
           })
         )}
       </div>
-      <p className="hint">Нажмите на запись, чтобы поправить вес или дату.</p>
+      <p className="hint">Нажмите на запись, чтобы поправить значение или дату.</p>
 
       <div className="sec">Откуда цифры</div>
       <div className="bt-card">
         <p className="hint" style={{ marginTop: 0 }}>
-          Кривые — WHO Child Growth Standards (2006), вес-к-возрасту, таблицы
-          L/M/S: по неделям до 13 недель и по месяцам до 5 лет. Перцентиль
-          считается из z-оценки по этим параметрам, а не берётся из
-          готовой таблицы, поэтому промежуточные возрасты считаются точно,
-          а не округляются до ближайшей недели.
+          Кривые — WHO Child Growth Standards (2006), таблицы L/M/S:
+          по неделям до 13 недель и по месяцам
+          до {ind.maxMonths === 24 ? "двух лет" : "пяти лет"}. Перцентиль
+          считается из z-оценки по этим параметрам, а не берётся из готовой
+          таблицы, поэтому промежуточные возрасты считаются точно, а не
+          округляются до ближайшей недели.
         </p>
         <p className="hint">
           Стандарт построен на доношенных детях. Для родившегося раньше срока
-          возраст положено считать скорректированным — приложение этого не
-          умеет, и его перцентиль будет занижен.
+          возраст положено считать скорректированным — приложение этого
+          не умеет, и его перцентиль будет занижен.
         </p>
-        <p className="hint">
-          Ежедневное взвешивание дома почти всегда даёт больше тревоги, чем
-          смысла: разброс между двумя измерениями подряд сопоставим с недельной
-          прибавкой. Раз в неделю-две достаточно.
-        </p>
+        <p className="hint">{MEASURE_NOTE[ind.key]}</p>
         <p className="hint">
           Пол: {SEX_LABEL[sex]}.{" "}
           <button className="linkish" onClick={() => onSex(sex === "m" ? "f" : "m")}>
@@ -1528,12 +1839,14 @@ function SettlePicker({ value, onPick, hint }) {
   );
 }
 
-function EditSheet({ ev, onShift, onMl, onGrams, onDays, onSettle, onClose, onDelete }) {
-  if (ev.type === "weight") {
+function EditSheet({ ev, onShift, onMl, onValue, onDays, onSettle, onClose, onDelete }) {
+  const ind = IND[ev.type];
+  if (ind) {
+    const [small, big] = ind.steps;
     return (
       <div className="sheet-bg" onClick={onClose}>
         <div className="sheet" onClick={(e) => e.stopPropagation()}>
-          <h3>Взвешивание</h3>
+          <h3>{ind.title}</h3>
           <div className="field">
             <span className="field-l">Дата</span>
             <div className="field-c">
@@ -1543,16 +1856,18 @@ function EditSheet({ ev, onShift, onMl, onGrams, onDays, onSettle, onClose, onDe
             </div>
           </div>
           <div className="field">
-            <span className="field-l">Вес, кг</span>
+            <span className="field-l">Значение, {ind.unit}</span>
             <div className="field-c">
-              <button className="nudge" onClick={() => onGrams(-50)}>−50</button>
-              <button className="nudge" onClick={() => onGrams(-10)}>−10</button>
-              <span className="field-v bt-num">{kgText(ev.meta?.g || 0)}</span>
-              <button className="nudge" onClick={() => onGrams(10)}>+10</button>
-              <button className="nudge" onClick={() => onGrams(50)}>+50</button>
+              <button className="nudge" onClick={() => onValue(-big)}>−{big}</button>
+              <button className="nudge" onClick={() => onValue(-small)}>−{small}</button>
+              <span className="field-v bt-num">
+                {valueText(ind, ev.meta?.[ind.metaKey] || 0)}
+              </span>
+              <button className="nudge" onClick={() => onValue(small)}>+{small}</button>
+              <button className="nudge" onClick={() => onValue(big)}>+{big}</button>
             </div>
           </div>
-          <p className="hint">Шаг кнопок — граммы.</p>
+          <p className="hint">Шаг кнопок — {ind.stepUnit}.</p>
           <div className="sheet-act">
             <button className="sact ghost" onClick={onClose}>Готово</button>
             <button className="sact del" onClick={onDelete}>Удалить</button>

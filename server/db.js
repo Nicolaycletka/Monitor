@@ -34,6 +34,28 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS idx_events_rev ON events(household_id, rev);
 
+/*
+ * Очередь уведомлений. Заменяет колонки notify_* в households:
+ * видов напоминаний стало больше одного (сон, кормление), и на
+ * каждый новый вид пришлось бы добавлять четыре колонки и ветку
+ * в планировщике. Текст готовит клиент — там же, где считается
+ * прогноз, — поэтому новый вид уведомления не требует правок
+ * на сервере вообще.
+ *
+ * Старые колонки notify_* намеренно не удаляются: SQLite умеет
+ * DROP COLUMN не везде, а пустые колонки никому не мешают.
+ */
+CREATE TABLE IF NOT EXISTS notifications (
+  household_id  TEXT NOT NULL REFERENCES households(id) ON DELETE CASCADE,
+  kind          TEXT NOT NULL,
+  at            INTEGER NOT NULL,
+  text          TEXT NOT NULL,
+  sent          INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (household_id, kind)
+);
+
+CREATE INDEX IF NOT EXISTS idx_notif_due ON notifications(sent, at);
+
 CREATE TABLE IF NOT EXISTS telegram_links (
   household_id  TEXT NOT NULL REFERENCES households(id) ON DELETE CASCADE,
   chat_id       TEXT NOT NULL,
@@ -58,6 +80,13 @@ addColumn("notify_to_label", "TEXT");
 addColumn("notify_sent", "INTEGER NOT NULL DEFAULT 1");
 // пол ребёнка ("m" | "f") — нужен для кривых веса ВОЗ, они разные
 addColumn("sex", "TEXT");
+/*
+ * Отключённые виды уведомлений — список через запятую ("feed,sleep").
+ * Хранится именно ОТКЛЮЧЁННОЕ, а не включённое: тогда вид, добавленный
+ * в будущей версии, у существующих семей заработает сам, а не окажется
+ * молча выключенным.
+ */
+addColumn("notify_off", "TEXT");
 
 /* ------------------------------------------------------------------ */
 
@@ -80,6 +109,7 @@ export const insertHousehold = db.prepare(`
 export const updateProfile = db.prepare(`
   UPDATE households
   SET name = @name, birth = @birth, sex = COALESCE(@sex, sex),
+      notify_off = COALESCE(@notify_off, notify_off),
       profile_updated_at = @updated_at
   WHERE id = @id AND profile_updated_at < @updated_at
 `);
@@ -117,28 +147,38 @@ export function pruneDeleted() {
 
 /* ---------- уведомления в Telegram ---------- */
 
-export const getNotifyState = db.prepare(
-  "SELECT notify_at, notify_sent FROM households WHERE id = ?"
+export const getNotification = db.prepare(
+  "SELECT at, sent FROM notifications WHERE household_id = ? AND kind = ?"
 );
 
-export const setNotify = db.prepare(`
-  UPDATE households
-  SET notify_at = @at, notify_from_label = @from_label, notify_to_label = @to_label, notify_sent = 0
-  WHERE id = @id
+export const setNotification = db.prepare(`
+  INSERT INTO notifications (household_id, kind, at, text, sent)
+  VALUES (@id, @kind, @at, @text, 0)
+  ON CONFLICT (household_id, kind) DO UPDATE SET
+    at = excluded.at, text = excluded.text, sent = 0
 `);
 
-export const clearNotify = db.prepare(`
-  UPDATE households
-  SET notify_at = NULL, notify_from_label = NULL, notify_to_label = NULL, notify_sent = 1
-  WHERE id = @id
-`);
+export const clearNotification = db.prepare(
+  "DELETE FROM notifications WHERE household_id = ? AND kind = ?"
+);
 
-export const markNotifySent = db.prepare("UPDATE households SET notify_sent = 1 WHERE id = ?");
+export const markNotificationSent = db.prepare(
+  "UPDATE notifications SET sent = 1 WHERE household_id = ? AND kind = ?"
+);
 
+/*
+ * Отключённые виды отсекаются прямо в запросе: если родитель выключил
+ * напоминания о кормлении, накопившаяся очередь не должна выстрелить
+ * при обратном включении. Строка вида "feed,sleep" ищется с запятыми
+ * по краям, иначе "feed" совпал бы с "feeding".
+ */
 export const dueNotifications = db.prepare(`
-  SELECT id, notify_at, notify_from_label, notify_to_label
-  FROM households
-  WHERE notify_at IS NOT NULL AND notify_sent = 0 AND notify_at <= ?
+  SELECT n.household_id AS id, n.kind, n.at, n.text
+  FROM notifications n
+  JOIN households h ON h.id = n.household_id
+  WHERE n.sent = 0 AND n.at <= ?
+    AND (h.notify_off IS NULL
+         OR INSTR(',' || h.notify_off || ',', ',' || n.kind || ',') = 0)
 `);
 
 export const lastSleepEvent = db.prepare(`
