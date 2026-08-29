@@ -119,19 +119,3 @@ button { font: inherit; }
 
 button:focus-visible, input:focus-visible { outline: 2px solid #8a97e6; outline-offset: 2px; }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
-
-/* метка «как прошло укладывание» */
-.settle { margin-top: 16px; }
-.settle-l { font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: #7d7593; margin-bottom: 8px; }
-.settle-row { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
-.settle-b {
-  background: #252031; border: 1px solid #342f45; color: #9b93b3;
-  border-radius: 12px; padding: 11px 6px; font-size: 13px; cursor: pointer;
-  line-height: 1.25;
-}
-.settle-b:active { background: #2b2739; }
-.settle-b.on { border-color: #e8a33d; color: #e8a33d; background: #2a2233; }
-
-/* период болезни */
-.bt-card.sick { border-color: #5a4630; background: #241f1a; }
-.sick-t { font-size: 13px; color: #e8a33d; font-weight: 500; }
