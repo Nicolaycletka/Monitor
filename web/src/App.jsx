@@ -661,14 +661,12 @@ function WeekView({ state, events, update, onStartIllness, onEndIllness }) {
   const sick = events.find((e) => e.type === "illness" && !e.end && !e.deleted);
   const past = illnessPeriods(events).filter((p) => p.end !== Infinity).slice(-4);
   const check = selfCheck(events, state.profile.birth);
-  // поправка может оказаться не числом, а парой «утро/вечер»
-  const profile_ = biasProfile(measureBias(events, state.profile.birth),
-    settleShare(events, Date.now(), state.profile.birth).hardShare,
-    settleShare(events, Date.now(), state.profile.birth).alertShare);
-  const win_slope = typeof profile_ === "object" ? profile_ : null;
   const shares = settleShare(events, Date.now(), state.profile.birth);
   const bias = measureBias(events, state.profile.birth);
   const auto = autoBias(bias, shares.hardShare, shares.alertShare);
+  // поправка может оказаться не числом, а парой «утро/вечер»
+  const profile_ = biasProfile(bias, shares.hardShare, shares.alertShare);
+  const win_slope = typeof profile_ === "object" ? profile_ : null;
   const nudge = settleNudge(events, Date.now());
   // сработал ли предохранитель: фильтры по меткам съели данные,
   // а сырое расхождение велико
@@ -904,7 +902,7 @@ function WeekView({ state, events, update, onStartIllness, onEndIllness }) {
                 ? "Почти не применяется: поправка мала, тонет в разбросе засыпаний или гасится тяжёлыми укладываниями."
                 : auto > 0
                 ? `Поправка «позже» берётся вполовину и тем слабее, чем чаще укладывания идут тяжело${
-                    hardShare ? ` (сейчас ${Math.round(hardShare * 100)}%)` : ""
+                    shares.hardShare ? ` (сейчас ${Math.round(shares.hardShare * 100)}%)` : ""
                   }: сдвинув окно позже, приложение заставит вас класть позже и потом измерит собственный сдвиг как факт о ребёнке.`
                 : "Поправка «раньше» берётся целиком: ошибиться рано дёшево — ребёнок не уснул, попробовали через четверть часа."}
             </p>
