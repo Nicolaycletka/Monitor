@@ -68,6 +68,7 @@ function auth(req, res, next) {
 
 r.post("/api/household", throttle, (req, res) => {
   const { name, birth } = req.body || {};
+  const sex = req.body?.sex === "m" || req.body?.sex === "f" ? req.body.sex : null;
   if (typeof name !== "string" || !name.trim() || !Number.isFinite(birth)) {
     return res.status(400).json({ error: "bad_profile" });
   }
@@ -78,6 +79,7 @@ r.post("/api/household", throttle, (req, res) => {
     token_hash: hash(token),
     name: name.trim().slice(0, 60),
     birth,
+    sex,
     profile_updated_at: Date.now(),
     created_at: Date.now(),
   });
@@ -90,9 +92,10 @@ const clean = (e, householdId, rev) => ({
   household_id: householdId,
   id: String(e.id).slice(0, 64),
   // illness — период болезни: данные за него не идут в обучение прогноза.
+  // weight — взвешивание, meta.g в граммах.
   // Неизвестные типы падают в "feed" молча, поэтому список нужно
   // расширять ОДНОВРЕМЕННО с клиентом, иначе записи тихо испортятся.
-  type: ["sleep", "feed", "diaper", "illness"].includes(e.type) ? e.type : "feed",
+  type: ["sleep", "feed", "diaper", "illness", "weight"].includes(e.type) ? e.type : "feed",
   start: Number(e.start) || 0,
   finish: e.end == null ? null : Number(e.end),
   meta: e.meta ? JSON.stringify(e.meta).slice(0, 500) : null,
@@ -135,6 +138,7 @@ r.post("/api/sync", throttle, auth, (req, res) => {
         id: hid,
         name: String(profile.name || "").slice(0, 60),
         birth: Number(profile.birth) || null,
+        sex: profile.sex === "m" || profile.sex === "f" ? profile.sex : null,
         updated_at: Number(profile.updatedAt),
       });
     }
@@ -171,7 +175,7 @@ r.post("/api/sync", throttle, auth, (req, res) => {
 
   const rows = eventsSince.all(hid, since);
   const current = db
-    .prepare("SELECT name, birth, profile_updated_at FROM households WHERE id = ?")
+    .prepare("SELECT name, birth, sex, profile_updated_at FROM households WHERE id = ?")
     .get(hid);
 
   res.json({
@@ -180,6 +184,7 @@ r.post("/api/sync", throttle, auth, (req, res) => {
     profile: {
       name: current.name,
       birth: current.birth,
+      sex: current.sex || null,
       updatedAt: current.profile_updated_at,
     },
     serverTime: Date.now(),

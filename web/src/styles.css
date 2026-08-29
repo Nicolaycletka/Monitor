@@ -142,3 +142,11 @@ button:focus-visible, input:focus-visible { outline: 2px solid #8a97e6; outline-
 .ill-d { font-size: 13px; color: #cfc9de; }
 .ill-act { display: flex; gap: 6px; flex-shrink: 0; }
 .ill-in { background: #252031; border: 1px solid #35304a; color: #cfc9de; border-radius: 8px; padding: 6px 8px; font-size: 13px; font-variant-numeric: tabular-nums; }
+
+/* вкладка «Вес» */
+.chart { width: 100%; height: auto; display: block; }
+.chart-cap { display: flex; justify-content: space-between; margin-top: 4px; font-size: 10px; color: #5d5670; }
+.wrow { display: flex; gap: 9px; }
+.wrow-w { flex: 1.2; }
+.wrow-d { flex: 1; }
+.linkish { background: none; border: none; padding: 0; color: #8a97e6; font-size: 12px; cursor: pointer; }

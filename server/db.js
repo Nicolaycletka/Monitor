@@ -56,6 +56,8 @@ addColumn("notify_at", "INTEGER");
 addColumn("notify_from_label", "TEXT");
 addColumn("notify_to_label", "TEXT");
 addColumn("notify_sent", "INTEGER NOT NULL DEFAULT 1");
+// пол ребёнка ("m" | "f") — нужен для кривых веса ВОЗ, они разные
+addColumn("sex", "TEXT");
 
 /* ------------------------------------------------------------------ */
 
@@ -64,12 +66,21 @@ export const findHousehold = db.prepare(
 );
 
 export const insertHousehold = db.prepare(`
-  INSERT INTO households (id, token_hash, name, birth, profile_updated_at, created_at)
-  VALUES (@id, @token_hash, @name, @birth, @profile_updated_at, @created_at)
+  INSERT INTO households (id, token_hash, name, birth, sex, profile_updated_at, created_at)
+  VALUES (@id, @token_hash, @name, @birth, @sex, @profile_updated_at, @created_at)
 `);
 
+/*
+ * sex пишется через COALESCE намеренно: телефон со старой версией
+ * приложения профиль присылает, а поля sex в нём нет. Прямое
+ * присваивание обнулило бы уже выбранный пол при первой же
+ * синхронизации со старого телефона — и кривые веса на новом
+ * телефоне молча исчезли бы.
+ */
 export const updateProfile = db.prepare(`
-  UPDATE households SET name = @name, birth = @birth, profile_updated_at = @updated_at
+  UPDATE households
+  SET name = @name, birth = @birth, sex = COALESCE(@sex, sex),
+      profile_updated_at = @updated_at
   WHERE id = @id AND profile_updated_at < @updated_at
 `);
 

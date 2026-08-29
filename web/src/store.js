@@ -115,11 +115,11 @@ export async function saveState(state) {
 /** База приложения: "/" в корне, "/monitor/" в подкаталоге. */
 export const API = `${import.meta.env.BASE_URL}api`;
 
-export async function createHousehold(name, birth) {
+export async function createHousehold(name, birth, sex = null) {
   const res = await fetch(`${API}/household`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ name, birth }),
+    body: JSON.stringify({ name, birth, sex }),
   });
   if (!res.ok) throw new Error("не удалось создать профиль на сервере");
   return res.json();
@@ -135,7 +135,8 @@ export async function relink(state) {
   if (!state.profile) throw new Error("нет профиля");
   const { token, householdId } = await createHousehold(
     state.profile.name,
-    state.profile.birth
+    state.profile.birth,
+    state.profile.sex || null
   );
   return {
     ...state,
@@ -220,6 +221,9 @@ export async function syncOnce(state) {
     profile = {
       name: data.profile.name,
       birth: data.profile.birth,
+      // sex мог прийти пустым от сервера, который ещё не обновлён, —
+      // тогда сохраняем локальное значение, а не затираем его
+      sex: data.profile.sex || profile?.sex || null,
       updatedAt: data.profile.updatedAt,
     };
     profileDirty = false;
