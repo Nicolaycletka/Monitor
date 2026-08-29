@@ -135,3 +135,10 @@ button:focus-visible, input:focus-visible { outline: 2px solid #8a97e6; outline-
 /* период болезни */
 .bt-card.sick { border-color: #5a4630; background: #241f1a; }
 .sick-t { font-size: 13px; color: #e8a33d; font-weight: 500; }
+
+/* периоды болезни */
+.ill-list { margin: 12px 0 4px; }
+.ill-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 0; border-top: 1px solid #2b2739; }
+.ill-d { font-size: 13px; color: #cfc9de; }
+.ill-act { display: flex; gap: 6px; flex-shrink: 0; }
+.ill-in { background: #252031; border: 1px solid #35304a; color: #cfc9de; border-radius: 8px; padding: 6px 8px; font-size: 13px; font-variant-numeric: tabular-nums; }

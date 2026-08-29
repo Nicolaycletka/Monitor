@@ -4,7 +4,7 @@ import {
   sleepNorm, isNightSleep, predictNext, daySegments, dayStats, measureBias,
   medianNapIn, typicalNap, autoBias, settleOf, settleStats,
   settleShare, settleNudge, SETTLE_KINDS, SETTLE_LABEL, SETTLE_HINT, RAW_ALARM,
-  illnessPeriods, sickNow, selfCheck, biasProfile,
+  selfCheck, biasProfile,
 } from "./sleep.js";
 import {
   loadState, saveState, createHousehold, syncOnce, uid, liveEvents,
@@ -17,15 +17,25 @@ const FEED_LABEL = {
 };
 const DIAPER_LABEL = { wet: "Мокрый", dirty: "Стул", mixed: "Мокрый и стул" };
 
+// Ветка по умолчанию раньше отсутствовала, и ЛЮБОЙ незнакомый тип
+// молча становился «Подгузник» — из-за этого запись о болезни
+// показывалась в дневнике как подгузник.
 const eventTitle = (e) =>
   e.type === "sleep"
     ? isNightSleep(e) ? "Ночной сон" : "Сон"
     : e.type === "feed"
     ? FEED_LABEL[e.meta?.kind] + (e.meta?.ml ? ` · ${e.meta.ml} мл` : "")
-    : DIAPER_LABEL[e.meta?.kind] || "Подгузник";
+    : e.type === "diaper"
+    ? DIAPER_LABEL[e.meta?.kind] || "Подгузник"
+    : e.type === "illness"
+    ? "Болезнь"
+    : e.type;
 
 const eventColor = (e) =>
-  e.type === "sleep" ? "#6c7bd9" : e.type === "feed" ? "#e8a33d" : "#5f9e86";
+  e.type === "sleep" ? "#6c7bd9"
+    : e.type === "feed" ? "#e8a33d"
+    : e.type === "illness" ? "#c46a5a"
+    : "#5f9e86";
 
 /* ================================================================== */
 
@@ -191,22 +201,27 @@ export default function App() {
     setTimeout(runSync, 800);
   };
 
-  // Период болезни: открытая запись illness (end === null) означает
-  // «болеет сейчас». Данные за период не идут в обучение прогноза.
+  // Период болезни задаётся датами, а не таймером: болезнь чаще всего
+  // отмечают задним числом, когда уже понятно, что это была она.
+  // Незакрытый период (end === null) означает «болеет до сих пор».
   const openIllness = events.find((e) => e.type === "illness" && !e.end);
 
-  const startIllness = () => {
-    const ev = { id: uid(), type: "illness", start: Date.now(), end: null };
+  const saveIllness = ({ id, from, to }) => {
+    const ev = {
+      id: id || uid(),
+      type: "illness",
+      start: from,
+      end: to,
+    };
     putEvent(ev);
-    flash("Отмечена болезнь", () => putEvent({ ...ev, deleted: true }));
+    flash(id ? "Период болезни обновлён" : "Период болезни добавлен");
     setTimeout(runSync, 800);
   };
 
-  const endIllness = () => {
-    if (!openIllness) return;
-    const snapshot = { ...openIllness };
-    putEvent({ ...openIllness, end: Date.now() });
-    flash("Выздоровел", () => putEvent(snapshot));
+  const removeIllness = (ev) => {
+    const snapshot = { ...ev };
+    putEvent({ ...ev, deleted: true });
+    flash("Период удалён", () => putEvent(snapshot));
     setTimeout(runSync, 800);
   };
 
@@ -267,13 +282,13 @@ export default function App() {
           <>
             {openIllness && (
               <div className="bt-card sick">
-                <div className="sick-t">Отмечена болезнь · с {dayLabel(startOfDay(openIllness.start))}</div>
+                <div className="sick-t">Болезнь · с {dayLabel(startOfDay(openIllness.start))}</div>
                 <p className="hint" style={{ marginTop: 6 }}>
                   Записи за это время не идут в обучение: приложение не запомнит
                   сбитый болезнью ритм как норму. Прогноз пока строится по тому,
-                  что было до, и сейчас он менее точен.
+                  что было до, и сейчас он менее точен. Дату выздоровления
+                  проставьте на вкладке «Неделя».
                 </p>
-                <button className="sact ghost full" onClick={endIllness}>Выздоровел</button>
               </div>
             )}
 
@@ -356,7 +371,7 @@ export default function App() {
 
         {tab === "week" && (
           <WeekView state={state} events={events} update={update}
-            onStartIllness={startIllness} onEndIllness={endIllness} />
+            onSaveIllness={saveIllness} onRemoveIllness={removeIllness} />
         )}
 
         <NetLine net={net} pending={pending} onRetry={runSync} onRelink={doRelink} />
@@ -579,6 +594,8 @@ function DayView({ events, offset, setOffset, onPick }) {
   // в списке — и суммы не сходятся
   const list = events
     .filter((e) => {
+      // болезнь — период, а не запись дня: в списке ей не место
+      if (e.type === "illness") return false;
       const end = e.type === "sleep" ? e.end ?? Date.now() : e.start;
       return end >= dayStart && e.start < dayStart + DAY;
     })
@@ -632,7 +649,113 @@ function DayView({ events, offset, setOffset, onPick }) {
   );
 }
 
-function WeekView({ state, events, update, onStartIllness, onEndIllness }) {
+/** Ввод дат — YYYY-MM-DD, локальная полночь. */
+const toInput = (ts) => {
+  const d = new Date(ts);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+};
+const fromInput = (v, endOfDay = false) => {
+  if (!v) return null;
+  const [y, m, d] = v.split("-").map(Number);
+  return endOfDay
+    ? new Date(y, m - 1, d, 23, 59, 59, 999).getTime()
+    : new Date(y, m - 1, d, 0, 0, 0, 0).getTime();
+};
+
+/**
+ * Периоды болезни задаются датами, а не таймером: болезнь обычно
+ * отмечают задним числом, когда уже понятно, что это была она,
+ * и «сейчас заболел / сейчас выздоровел» почти никогда не совпадает
+ * с реальными границами.
+ *
+ * Дату окончания можно оставить пустой — тогда период открытый
+ * («болеет до сих пор»).
+ */
+function IllnessCard({ periods, onSave, onRemove }) {
+  const [editId, setEditId] = useState(null);
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+
+  const open = (p) => {
+    setEditId(p ? p.id : "new");
+    setFrom(p ? toInput(p.start) : toInput(Date.now()));
+    setTo(p && p.end ? toInput(p.end) : "");
+  };
+  const close = () => setEditId(null);
+
+  const save = () => {
+    const start = fromInput(from);
+    const end = fromInput(to, true);
+    if (!start) return;
+    if (end && end < start) return;
+    onSave({ id: editId === "new" ? null : editId, from: start, to: end });
+    close();
+  };
+
+  const bad = from && to && fromInput(to, true) < fromInput(from);
+
+  return (
+    <div className="bt-card">
+      <p className="hint" style={{ marginTop: 0 }}>
+        Болезнь сбивает ритм сна, и если эти дни попадут в расчёт, приложение
+        запомнит их как норму ребёнка. Отмеченные периоды исключаются из
+        обучения, но остаются видны в дневнике.
+      </p>
+
+      {periods.length > 0 && (
+        <div className="ill-list">
+          {periods.map((p) => (
+            <div className="ill-row" key={p.id}>
+              <span className="ill-d bt-num">
+                {dayLabel(startOfDay(p.start))} –{" "}
+                {p.end ? dayLabel(startOfDay(p.end)) : "по сей день"}
+              </span>
+              <span className="ill-act">
+                <button className="nudge" onClick={() => open(p)}>Изменить</button>
+                <button className="nudge" onClick={() => onRemove(p)}>Убрать</button>
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {editId ? (
+        <>
+          <div className="field">
+            <span className="field-l">Начало</span>
+            <input className="ill-in" type="date" value={from}
+              onChange={(e) => setFrom(e.target.value)} />
+          </div>
+          <div className="field">
+            <span className="field-l">Окончание</span>
+            <input className="ill-in" type="date" value={to}
+              onChange={(e) => setTo(e.target.value)} />
+          </div>
+          <p className="hint">
+            {bad
+              ? "Окончание раньше начала — исправьте даты."
+              : to
+              ? "День окончания входит в период целиком."
+              : "Пустое окончание — болезнь продолжается."}
+          </p>
+          <div className="sheet-act">
+            <button className="sact ghost" onClick={close}>Отмена</button>
+            <button className="sact ghost" disabled={!from || bad} onClick={save}>
+              Сохранить
+            </button>
+          </div>
+        </>
+      ) : (
+        <button className="sact ghost full" onClick={() => open(null)}>
+          Добавить период болезни
+        </button>
+      )}
+    </div>
+  );
+}
+
+function WeekView({ state, events, update, onSaveIllness, onRemoveIllness }) {
   const [copied, setCopied] = useState(false);
   const [tgLink, setTgLink] = useState(null);
   const [tgErr, setTgErr] = useState(false);
@@ -658,8 +781,9 @@ function WeekView({ state, events, update, onStartIllness, onEndIllness }) {
   const napBefore = medianNapIn(events, today - 13 * DAY, today - 6 * DAY);
   const norm = sleepNorm(ageMonths(state.profile.birth, Date.now()));
   const weekEnd = today + DAY;
-  const sick = events.find((e) => e.type === "illness" && !e.end && !e.deleted);
-  const past = illnessPeriods(events).filter((p) => p.end !== Infinity).slice(-4);
+  const illnessEvents = events
+    .filter((e) => e.type === "illness" && !e.deleted)
+    .sort((a, b) => b.start - a.start);
   const check = selfCheck(events, state.profile.birth);
   const shares = settleShare(events, Date.now(), state.profile.birth);
   const bias = measureBias(events, state.profile.birth);
@@ -734,38 +858,11 @@ function WeekView({ state, events, update, onStartIllness, onEndIllness }) {
       )}
 
       <div className="sec">Болезнь</div>
-      <div className="bt-card">
-        {sick ? (
-          <>
-            <p className="hint" style={{ marginTop: 0 }}>
-              Идёт с {dayLabel(startOfDay(sick.start))}. Записи за это время
-              не идут в обучение прогноза.
-            </p>
-            <button className="sact ghost full" onClick={onEndIllness}>Выздоровел</button>
-          </>
-        ) : (
-          <>
-            <p className="hint" style={{ marginTop: 0 }}>
-              Болезнь сбивает ритм сна, и если эти дни попадут в расчёт,
-              приложение запомнит их как норму ребёнка. Отметьте период —
-              и он будет исключён из обучения, но останется виден в дневнике.
-            </p>
-            <button className="sact ghost full" onClick={onStartIllness}>Ребёнок болеет</button>
-          </>
-        )}
-        {past.length > 0 && (
-          <p className="hint">
-            Прошлые периоды:{" "}
-            {past.map((p, i) => (
-              <span key={i}>
-                {i > 0 && ", "}
-                {dayLabel(startOfDay(p.start))} – {dayLabel(startOfDay(p.end))}
-              </span>
-            ))}
-            . Сны за них исключены навсегда.
-          </p>
-        )}
-      </div>
+      <IllnessCard
+        periods={illnessEvents}
+        onSave={onSaveIllness}
+        onRemove={onRemoveIllness}
+      />
 
       <div className="sec">Как проходят укладывания</div>
       <div className="bt-card">
