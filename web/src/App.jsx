@@ -1,12 +1,14 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import {
   MIN, DAY, startOfDay, hhmm, dur, durShort, ageText, ageMonths, dayLabel,
-  sleepNorm, isNightSleep, predictWindow, daySegments, dayStats, measureBias,
-  medianNapIn,
+  sleepNorm, isNightSleep, predictNext, daySegments, dayStats, measureBias,
+  medianNapIn, typicalNap, autoBias, settleOf, settleStats,
+  settleShare, settleNudge, SETTLE_KINDS, SETTLE_LABEL, SETTLE_HINT, RAW_ALARM,
+  illnessPeriods, sickNow, selfCheck, biasProfile,
 } from "./sleep.js";
 import {
   loadState, saveState, createHousehold, syncOnce, uid, liveEvents,
-  inviteLink, readJoinToken, API, relink,
+  inviteLink, readJoinToken, API, relink, fetchTelegramLink, MANUAL_BIAS_LIMIT,
 } from "./store.js";
 
 const FEED_LABEL = {
@@ -182,6 +184,32 @@ export default function App() {
     setTimeout(runSync, 800);
   };
 
+  const setSettle = (ev, kind) => {
+    const cur = settleOf(ev);
+    const next = cur === kind ? undefined : kind;
+    putEvent({ ...ev, meta: { ...(ev.meta || {}), settle: next } });
+    setTimeout(runSync, 800);
+  };
+
+  // Период болезни: открытая запись illness (end === null) означает
+  // «болеет сейчас». Данные за период не идут в обучение прогноза.
+  const openIllness = events.find((e) => e.type === "illness" && !e.end);
+
+  const startIllness = () => {
+    const ev = { id: uid(), type: "illness", start: Date.now(), end: null };
+    putEvent(ev);
+    flash("Отмечена болезнь", () => putEvent({ ...ev, deleted: true }));
+    setTimeout(runSync, 800);
+  };
+
+  const endIllness = () => {
+    if (!openIllness) return;
+    const snapshot = { ...openIllness };
+    putEvent({ ...openIllness, end: Date.now() });
+    flash("Выздоровел", () => putEvent(snapshot));
+    setTimeout(runSync, 800);
+  };
+
   const shift = (ev, field, mins) => putEvent({ ...ev, [field]: ev[field] + mins * MIN });
 
   const removeEvent = (ev) => {
@@ -220,7 +248,13 @@ export default function App() {
   }
 
   const { profile, bias } = state;
-  const win = active ? null : predictWindow(events, profile.birth, tick, bias || 0);
+  // predictNext сам измеряет личную поправку по хвосту истории
+  // (~3 мс на 90 днях) и применяет её — отдельно её считать не нужно
+  const win = active ? null : predictNext(events, profile.birth, tick, bias || 0);
+  const napRef = useMemo(
+    () => (active ? typicalNap(events, active.start, 10, profile.birth) : null),
+    [events, active?.start, profile.birth]
+  );
   const todayStart = startOfDay(tick);
   const pending = (state.events || []).filter((e) => e.dirty).length;
 
@@ -234,6 +268,18 @@ export default function App() {
 
         {tab === "now" && (
           <>
+            {openIllness && (
+              <div className="bt-card sick">
+                <div className="sick-t">Отмечена болезнь · с {dayLabel(startOfDay(openIllness.start))}</div>
+                <p className="hint" style={{ marginTop: 6 }}>
+                  Записи за это время не идут в обучение: приложение не запомнит
+                  сбитый болезнью ритм как норму. Прогноз пока строится по тому,
+                  что было до, и сейчас он менее точен.
+                </p>
+                <button className="sact ghost full" onClick={endIllness}>Выздоровел</button>
+              </div>
+            )}
+
             <div className="rib-wrap">
               <Ribbon events={events} dayStart={todayStart} showNow />
               <Axis />
@@ -263,7 +309,16 @@ export default function App() {
               </div>
 
               {win && <WindowBar win={win} now={tick} />}
-              {active && !isNightSleep(active) && <NapNote start={active.start} now={tick} />}
+              {active && !isNightSleep(active) && (
+                <>
+                  <NapNote start={active.start} now={tick} typical={napRef} />
+                  <SettlePicker
+                    value={settleOf(active)}
+                    onPick={(k) => setSettle(active, k)}
+                    hint="Только если было что отметить. Обычные укладывания отмечать не нужно — приложение считает их нормой."
+                  />
+                </>
+              )}
 
               <button className={"big " + (active ? "wake" : "sleep")} onClick={toggleSleep}>
                 {active ? "Проснулся" : "Заснул"}
@@ -303,7 +358,8 @@ export default function App() {
         )}
 
         {tab === "week" && (
-          <WeekView state={state} events={events} update={update} />
+          <WeekView state={state} events={events} update={update}
+            onStartIllness={startIllness} onEndIllness={endIllness} />
         )}
 
         <NetLine net={net} pending={pending} onRetry={runSync} onRelink={doRelink} />
@@ -328,6 +384,10 @@ export default function App() {
             if (cur) putEvent({ ...cur, meta: { ...cur.meta, ml: Math.max(0, (cur.meta?.ml || 0) + d) } });
           }}
           onClose={() => setEditing(null)}
+          onSettle={(k) => {
+            const cur = events.find((e) => e.id === editing.id);
+            if (cur) setSettle(cur, k);
+          }}
           onDelete={() => removeEvent(events.find((e) => e.id === editing.id) || editing)}
         />
       )}
@@ -441,14 +501,25 @@ function WindowBar({ win, now }) {
   );
 }
 
-function NapNote({ start, now }) {
+/**
+ * Оценка идущего сна. Порог «короткого» — относительный, от медианы
+ * дневных снов самого ребёнка: тот же 0.7, что и в predictWindow.
+ * Абсолютные 45 минут в 3-5 месяцев срабатывали бы почти на каждом
+ * сне, когда все они становятся односцикловыми.
+ *
+ * Порог «поверхностного» остаётся абсолютным намеренно: цикл сна
+ * у младенца длится порядка 40-50 минут, и пробуждение до 25 минут
+ * означает неполный цикл независимо от того, какая у ребёнка медиана.
+ */
+function NapNote({ start, now, typical }) {
   const len = (now - start) / MIN;
+  const short = typical != null ? typical * 0.7 : 45;
   return (
     <div className="win-text" style={{ marginTop: 16 }}>
       {len < 25
         ? "Меньше 25 минут — сон, скорее всего, поверхностный"
-        : len < 45
-        ? "Короткий сон · следующее окно стоит сократить"
+        : len < short
+        ? `Короткий для него${typical != null ? ` (медиана ${Math.round(typical)} мин)` : ""} · следующее окно стоит сократить`
         : "Полноценный сон"}
     </div>
   );
@@ -564,24 +635,58 @@ function DayView({ events, offset, setOffset, onPick }) {
   );
 }
 
-function WeekView({ state, events, update }) {
+function WeekView({ state, events, update, onStartIllness, onEndIllness }) {
   const [copied, setCopied] = useState(false);
+  const [tgLink, setTgLink] = useState(null);
+  const [tgErr, setTgErr] = useState(false);
   const today = startOfDay(Date.now());
   const days = Array.from({ length: 7 }, (_, i) => today - (6 - i) * DAY);
   const stats = days.map((d) => dayStats(events, d));
-  // первый день ведения дневника всегда обрезан — он занижает средние
-  const firstWith = stats.findIndex((s) => s.total > 0);
-  const counted = stats
-    .map((s, i) => ({ s, i }))
-    .filter(({ s, i }) => s.total > 0 && !(i === firstWith && stats.filter((x) => x.total > 0).length > 1))
-    .map(({ s }) => s);
+  // Из средних выбрасываются обрезанные сутки: первый день ведения
+  // дневника (он всегда начат с середины) и сегодняшний, который ещё
+  // не закончился. Раньше сегодняшний считался как полный и занижал
+  // всё на несколько часов — по нему нельзя было читать динамику.
+  const withData = stats.map((s, i) => ({ s, i })).filter(({ s }) => s.total > 0);
+  const drop = new Set();
+  if (withData.length > 1) drop.add(withData[0].i);
+  const kept = () => withData.filter(({ i }) => !drop.has(i));
+  // сегодняшний день выбрасывается только если после этого хоть что-то
+  // останется: в первый же день ведения дневника средние иначе обнулятся
+  if (kept().length > 1 && kept().some(({ i }) => i === 6)) drop.add(6);
+  const counted = kept().map(({ s }) => s);
+  const todayExcluded = drop.has(6);
   const avg = (f) => (counted.length ? counted.reduce((a, s) => a + f(s), 0) / counted.length : 0);
 
   const napNow = medianNapIn(events, today - 6 * DAY, today + DAY);
   const napBefore = medianNapIn(events, today - 13 * DAY, today - 6 * DAY);
   const norm = sleepNorm(ageMonths(state.profile.birth, Date.now()));
+  const weekEnd = today + DAY;
+  const sick = events.find((e) => e.type === "illness" && !e.end && !e.deleted);
+  const past = illnessPeriods(events).filter((p) => p.end !== Infinity).slice(-4);
+  const check = selfCheck(events, state.profile.birth);
+  // поправка может оказаться не числом, а парой «утро/вечер»
+  const profile_ = biasProfile(measureBias(events, state.profile.birth),
+    settleShare(events, Date.now(), state.profile.birth).hardShare,
+    settleShare(events, Date.now(), state.profile.birth).alertShare);
+  const win_slope = typeof profile_ === "object" ? profile_ : null;
+  const shares = settleShare(events, Date.now(), state.profile.birth);
   const bias = measureBias(events, state.profile.birth);
+  const auto = autoBias(bias, shares.hardShare, shares.alertShare);
+  const nudge = settleNudge(events, Date.now());
+  // сработал ли предохранитель: фильтры по меткам съели данные,
+  // а сырое расхождение велико
+  const rawFallback =
+    bias && !bias.usable && bias.raw && Math.abs(bias.raw.median) >= RAW_ALARM;
+  const settleNow = settleStats(events, weekEnd - 7 * DAY, weekEnd, state.profile.birth);
+  const settleBefore = settleStats(events, weekEnd - 14 * DAY, weekEnd - 7 * DAY, state.profile.birth);
   const link = inviteLink(state.auth.token);
+
+  useEffect(() => {
+    fetchTelegramLink(state.auth.token).then(
+      (url) => (url ? setTgLink(url) : setTgErr(true)),
+      () => setTgErr(true)
+    );
+  }, [state.auth.token]);
 
   return (
     <>
@@ -619,40 +724,234 @@ function WeekView({ state, events, update }) {
             })()}
       </p>
 
-      {napNow != null && (
+      {(napNow != null || todayExcluded) && (
         <p className="hint">
-          Медиана дневного сна за неделю — <b>{Math.round(napNow)} мин</b>
-          {napBefore != null && (
-            <>, неделей раньше <b>{Math.round(napBefore)} мин</b></>
-          )}.
+          {napNow != null && (
+            <>
+              Медиана дневного сна за неделю — <b>{Math.round(napNow)} мин</b>
+              {napBefore != null && (
+                <>, неделей раньше <b>{Math.round(napBefore)} мин</b></>
+              )}.{" "}
+            </>
+          )}
+          {todayExcluded && "Сегодняшний день в средние не входит — сутки ещё не закончились."}
         </p>
+      )}
+
+      <div className="sec">Болезнь</div>
+      <div className="bt-card">
+        {sick ? (
+          <>
+            <p className="hint" style={{ marginTop: 0 }}>
+              Идёт с {dayLabel(startOfDay(sick.start))}. Записи за это время
+              не идут в обучение прогноза.
+            </p>
+            <button className="sact ghost full" onClick={onEndIllness}>Выздоровел</button>
+          </>
+        ) : (
+          <>
+            <p className="hint" style={{ marginTop: 0 }}>
+              Болезнь сбивает ритм сна, и если эти дни попадут в расчёт,
+              приложение запомнит их как норму ребёнка. Отметьте период —
+              и он будет исключён из обучения, но останется виден в дневнике.
+            </p>
+            <button className="sact ghost full" onClick={onStartIllness}>Ребёнок болеет</button>
+          </>
+        )}
+        {past.length > 0 && (
+          <p className="hint">
+            Прошлые периоды:{" "}
+            {past.map((p, i) => (
+              <span key={i}>
+                {i > 0 && ", "}
+                {dayLabel(startOfDay(p.start))} – {dayLabel(startOfDay(p.end))}
+              </span>
+            ))}
+            . Сны за них исключены навсегда.
+          </p>
+        )}
+      </div>
+
+      <div className="sec">Как проходят укладывания</div>
+      <div className="bt-card">
+        {settleNow.total === 0 ? (
+          <p className="hint" style={{ marginTop: 0 }}>
+            Записей за неделю пока нет.
+          </p>
+        ) : settleNow.marked === 0 ? (
+          <p className="hint" style={{ marginTop: 0 }}>
+            Отмеченных укладываний нет — приложение считает, что всё проходит
+            обычно. Если ребёнок плакал и не мог уснуть или наоборот был бодрым
+            и не хотел спать, отметьте это на вкладке «Сейчас» или в карточке сна.
+          </p>
+        ) : (
+          <>
+            <div className="kpi">
+              <div>
+                <div className="kpi-v bt-num">{settleNow.hard}</div>
+                <div className="kpi-l">плакал</div>
+              </div>
+              <div>
+                <div className="kpi-v bt-num">{settleNow.alert}</div>
+                <div className="kpi-l">был бодрый</div>
+              </div>
+            </div>
+            <p className="hint">
+              Плакал — <b>{settleNow.hard}</b>
+              {settleBefore.marked > 0 && <>, неделей раньше <b>{settleBefore.hard}</b></>}
+              . Был бодрый — <b>{settleNow.alert}</b>
+              {settleBefore.marked > 0 && <>, было <b>{settleBefore.alert}</b></>}
+              {` из ${settleNow.total} дневных снов`}.
+              {settleNow.hard > 0
+                ? " «Плакал» сдвигает окно раньше."
+                : ""}
+              {settleNow.alert > 0
+                ? " «Был бодрый» само окно не двигает — оно уже растянуто измеренной поправкой; метка лишь позволяет применить её полностью."
+                : ""}
+            </p>
+          </>
+        )}
+      </div>
+
+      {check && (
+        <>
+          <div className="sec">Самопроверка</div>
+          <div className={"bt-card" + (check.failing ? " sick" : "")}>
+            <div className="kpi">
+              <div>
+                <div className="kpi-v bt-num">{check.corrected}</div>
+                <div className="kpi-l">ошибка с поправками</div>
+              </div>
+              <div>
+                <div className="kpi-v bt-num">{check.table}</div>
+                <div className="kpi-l">ошибка по голой таблице</div>
+              </div>
+            </div>
+            <p className="hint">
+              {check.failing ? (
+                <>
+                  По {check.n} засыпаниям голая возрастная таблица оказалась
+                  точнее, чем алгоритм со всеми поправками. Поправки{" "}
+                  <b>временно отключены</b> — приложение считает по таблице,
+                  пока картина не изменится. Ручной сдвиг сохраняется.
+                </>
+              ) : (
+                <>
+                  По {check.n} засыпаниям поправки точнее голой возрастной
+                  таблицы на {check.table - check.corrected} мин. Сравнение
+                  смещено в пользу поправок: вы укладывали ребёнка по тому
+                  прогнозу, который приложение показывало. Поэтому обратный
+                  результат был бы сильным сигналом, а этот — умеренным.
+                </>
+              )}
+            </p>
+          </div>
+        </>
       )}
 
       <div className="sec">Поправка на вашего ребёнка</div>
       <div className="bt-card">
-        {bias ? (
-          <p className="hint" style={{ marginTop: 0 }}>
-            По {bias.n} дневным снам ребёнок засыпает в среднем на{" "}
-            <b>{bias.mean > 0 ? `${bias.mean} мин позже` : `${-bias.mean} мин раньше`}</b>{" "}
-            середины предсказанного окна.
-          </p>
+        {bias && (bias.usable || bias.raw) ? (
+          <>
+            {bias.usable && (
+              <p className="hint" style={{ marginTop: 0 }}>
+                По {bias.n} дневным снам ребёнок засыпает на{" "}
+                <b>{bias.median > 0 ? `${bias.median} мин позже` : `${-bias.median} мин раньше`}</b>{" "}
+                середины предсказанного окна (медиана, разброс ±{bias.spread} мин).
+              </p>
+            )}
+            {bias.raw && Math.abs(bias.raw.median - (bias.usable ? bias.median : bias.raw.median)) >= 15 && (
+              <p className="hint" style={{ marginTop: bias.usable ? undefined : 0 }}>
+                Без учёта меток расхождение — <b>{bias.raw.median} мин</b> по {bias.raw.n} снам.
+                Разница с цифрой выше означает, что метки укладывания заметно меняют картину.
+              </p>
+            )}
+            {rawFallback && (
+              <p className="hint">
+                Метки отсеяли почти все наблюдения, а расхождение велико — приложение
+                опирается на сырые данные. Обычно это значит, что возрастная таблица
+                просто не про вашего ребёнка.
+              </p>
+            )}
+            <div className="field">
+              <span className="field-l">Приложение применяет</span>
+              <span className="field-v bt-num">
+                {auto > 0 ? `+${auto}` : auto} мин
+              </span>
+            </div>
+            {win_slope && (
+              <div className="field">
+                <span className="field-l">Форма дня (утро / вечер)</span>
+                <span className="field-v bt-num">
+                  {win_slope.early > 0 ? `+${win_slope.early}` : win_slope.early}
+                  {" / "}
+                  {win_slope.late > 0 ? `+${win_slope.late}` : win_slope.late} мин
+                </span>
+              </div>
+            )}
+            {nudge !== 0 && (
+              <>
+                <div className="field">
+                  <span className="field-l">Сдвиг по меткам укладывания</span>
+                  <span className="field-v bt-num">{nudge} мин</span>
+                </div>
+                <p className="hint">
+                  Тяжёлое укладывание означает, что готовность ко сну была раньше
+                  записанного засыпания. Окно сдвигается раньше, пока такие
+                  укладывания не станут редкими — и сдвиг тогда уйдёт сам.
+                </p>
+              </>
+            )}
+            <p className="hint">
+              {auto === 0
+                ? "Почти не применяется: поправка мала, тонет в разбросе засыпаний или гасится тяжёлыми укладываниями."
+                : auto > 0
+                ? `Поправка «позже» берётся вполовину и тем слабее, чем чаще укладывания идут тяжело${
+                    hardShare ? ` (сейчас ${Math.round(hardShare * 100)}%)` : ""
+                  }: сдвинув окно позже, приложение заставит вас класть позже и потом измерит собственный сдвиг как факт о ребёнке.`
+                : "Поправка «раньше» берётся целиком: ошибиться рано дёшево — ребёнок не уснул, попробовали через четверть часа."}
+            </p>
+          </>
         ) : (
           <p className="hint" style={{ marginTop: 0 }}>
             Нужно хотя бы пять дневных снов, чтобы посчитать поправку.
           </p>
         )}
+        {state.biasResetFrom != null && (
+          <>
+            <p className="hint">
+              Прежняя ручная поправка{" "}
+              <b>{state.biasResetFrom > 0 ? `+${state.biasResetFrom}` : state.biasResetFrom} мин</b>{" "}
+              снята. Раньше она хранила всю поправку целиком, теперь приложение
+              считает её само — старое значение прибавилось бы вторым разом.
+            </p>
+            <button
+              className="sact ghost full"
+              onClick={() => update((s) => ({ ...s, biasResetFrom: null }))}
+            >
+              Понятно
+            </button>
+          </>
+        )}
         <div className="field">
-          <span className="field-l">Сдвиг окна</span>
+          <span className="field-l">Ручной сдвиг сверх этого</span>
           <div className="field-c">
-            <button className="nudge" onClick={() => update((s) => ({ ...s, bias: (s.bias || 0) - 5 }))}>−5</button>
+            <button
+              className="nudge"
+              disabled={(state.bias || 0) <= -MANUAL_BIAS_LIMIT}
+              onClick={() => update((s) => ({ ...s, bias: Math.max((s.bias || 0) - 5, -MANUAL_BIAS_LIMIT) }))}
+            >−5</button>
             <span className="field-v bt-num">{state.bias > 0 ? `+${state.bias}` : state.bias || 0}</span>
-            <button className="nudge" onClick={() => update((s) => ({ ...s, bias: (s.bias || 0) + 5 }))}>+5</button>
+            <button
+              className="nudge"
+              disabled={(state.bias || 0) >= MANUAL_BIAS_LIMIT}
+              onClick={() => update((s) => ({ ...s, bias: Math.min((s.bias || 0) + 5, MANUAL_BIAS_LIMIT) }))}
+            >+5</button>
           </div>
         </div>
-        {bias && Math.abs(bias.mean - (state.bias || 0)) >= 5 && (
-          <button className="sact ghost full"
-            onClick={() => update((s) => ({ ...s, bias: bias.mean }))}>
-            Применить измеренную поправку
+        {(state.bias || 0) !== 0 && (
+          <button className="sact ghost full" onClick={() => update((s) => ({ ...s, bias: 0 }))}>
+            Сбросить в ноль
           </button>
         )}
       </div>
@@ -674,6 +973,24 @@ function WeekView({ state, events, update }) {
         }}>
           {copied ? "Скопировано" : "Поделиться ссылкой"}
         </button>
+      </div>
+
+      <div className="sec">Уведомления в Telegram</div>
+      <div className="bt-card">
+        <p className="hint" style={{ marginTop: 0 }}>
+          Бот пришлёт сообщение, когда пора укладывать — по тому же прогнозу,
+          что и на вкладке «Сейчас». Откройте ссылку в Telegram на телефоне
+          каждого родителя, кто хочет получать напоминания.
+        </p>
+        {tgLink ? (
+          <a className="sact ghost full" href={tgLink} target="_blank" rel="noreferrer">
+            Открыть бота
+          </a>
+        ) : tgErr ? (
+          <p className="hint">Бот сейчас недоступен — попробуйте позже.</p>
+        ) : (
+          <p className="hint">Загружаю ссылку…</p>
+        )}
       </div>
 
       <div className="sec">Откуда цифры</div>
@@ -709,7 +1026,33 @@ function WeekView({ state, events, update }) {
   );
 }
 
-function EditSheet({ ev, onShift, onMl, onClose, onDelete }) {
+/**
+ * Три кнопки «как прошло укладывание». Необязательны: без метки
+ * расчёт работает как раньше. Повторный тап по выбранной снимает её.
+ */
+function SettlePicker({ value, onPick, hint }) {
+  return (
+    <div className="settle">
+      <div className="settle-l">Что-то пошло не так?</div>
+      <div className="settle-row">
+        {SETTLE_KINDS.map((k) => (
+          <button
+            key={k}
+            className={"settle-b" + (value === k ? " on" : "")}
+            onClick={() => onPick(k)}
+            title={SETTLE_HINT[k]}
+          >
+            {SETTLE_LABEL[k]}
+          </button>
+        ))}
+      </div>
+      {value && <p className="hint" style={{ marginTop: 8 }}>{SETTLE_HINT[value]}</p>}
+      {!value && hint && <p className="hint" style={{ marginTop: 8 }}>{hint}</p>}
+    </div>
+  );
+}
+
+function EditSheet({ ev, onShift, onMl, onSettle, onClose, onDelete }) {
   return (
     <div className="sheet-bg" onClick={onClose}>
       <div className="sheet" onClick={(e) => e.stopPropagation()}>
@@ -723,6 +1066,9 @@ function EditSheet({ ev, onShift, onMl, onClose, onDelete }) {
               <span className="field-v bt-num">{dur(ev.end - ev.start)}</span>
             </div>
           </>
+        )}
+        {ev.type === "sleep" && !isNightSleep(ev) && (
+          <SettlePicker value={settleOf(ev)} onPick={onSettle} />
         )}
         {ev.type === "feed" && ev.meta?.kind === "formula" && (
           <div className="field">

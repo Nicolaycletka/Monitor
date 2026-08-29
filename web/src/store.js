@@ -6,6 +6,8 @@
  * "последняя запись побеждает" на основе updatedAt.
  */
 
+import { predictNext, hhmm } from "./sleep.js";
+
 const DB_NAME = "baby-tracker";
 const STORE = "kv";
 const KEY = "state";
@@ -45,19 +47,51 @@ async function idbSet(key, value) {
 
 /* ------------------------------------------------------------------ */
 
+/**
+ * Версия локального состояния. Поднимается, когда меняется СМЫСЛ уже
+ * сохранённых полей, а не только их набор — тогда старое значение надо
+ * не дополнить, а обезвредить.
+ *
+ * 2: bias сменил смысл. Раньше кнопка «Применить измеренную поправку»
+ *    записывала туда ВСЮ поправку целиком (скажем, 36 минут). Теперь
+ *    приложение считает поправку само, а bias — ручная добавка ПОВЕРХ
+ *    неё. Старое значение стало бы вторым слагаемым того же самого:
+ *    удвоение, о котором никто бы не догадался. Плюс шагом ±5 из 36
+ *    в ноль не попасть, то есть руками это было не убрать.
+ */
+export const STATE_VERSION = 2;
+
+/** Ручная добавка ограничена: она идёт мимо всего демпфирования. */
+export const MANUAL_BIAS_LIMIT = 30;
+
 export const emptyState = {
   profile: null,      // { name, birth, updatedAt }
   events: [],         // { id, type, start, end, meta, deleted, updatedAt, dirty }
   auth: null,         // { token, householdId }
   rev: 0,             // курсор сервера
-  bias: 0,            // личная поправка окна, минуты
+  bias: 0,            // ручная добавка к поправке, минуты
+  schema: STATE_VERSION,
+  biasResetFrom: null, // сколько сняли при миграции — показать один раз
   profileDirty: false,
 };
+
+/** Разовые правки при загрузке состояния, сохранённого старой версией. */
+export function migrate(saved) {
+  const st = { ...emptyState, ...saved };
+  if ((saved.schema || 1) < 2) {
+    // старый bias нёс всю поправку и теперь удваивал бы её
+    st.biasResetFrom = saved.bias || null;
+    st.bias = 0;
+  }
+  st.bias = Math.min(Math.max(st.bias || 0, -MANUAL_BIAS_LIMIT), MANUAL_BIAS_LIMIT);
+  st.schema = STATE_VERSION;
+  return st;
+}
 
 export async function loadState() {
   try {
     const saved = await idbGet(KEY);
-    if (saved) return { ...emptyState, ...saved };
+    if (saved) return migrate(saved);
   } catch (e) {
     console.warn("IndexedDB недоступна, работаем в памяти", e);
   }
@@ -112,6 +146,22 @@ export async function relink(state) {
   };
 }
 
+/**
+ * Прогноз окна следующего сна для Telegram-уведомления. Считается тут
+ * же, где и для интерфейса (personal bias, sleep.js), — сервер прогноз
+ * не пересчитывает, только хранит время и шлёт сообщение по расписанию.
+ * null — явная отмена (ребёнок спит сейчас, или прогноз устарел/недоступен).
+ */
+function computeNotify(state) {
+  if (!state.profile?.birth) return null;
+  const events = liveEvents(state.events || []);
+  const active = events.find((e) => e.type === "sleep" && !e.end);
+  if (active) return null;
+  const win = predictNext(events, state.profile.birth, Date.now(), state.bias || 0);
+  if (!win || win.stale) return null;
+  return { at: win.calm, fromLabel: hhmm(win.from), toLabel: hhmm(win.to) };
+}
+
 const stripLocal = (e) => ({
   id: e.id,
   type: e.type,
@@ -142,6 +192,7 @@ export async function syncOnce(state) {
       since: state.rev || 0,
       events: dirty.map(stripLocal),
       profile: state.profileDirty && state.profile ? state.profile : undefined,
+      notify: computeNotify(state),
     }),
   });
 
@@ -192,4 +243,14 @@ export function inviteLink(token) {
 export function readJoinToken() {
   const m = location.hash.match(/join=([A-Za-z0-9_-]+)/);
   return m ? m[1] : null;
+}
+
+/** Ссылка вида t.me/bot?start=<householdId> — сервер сам знает username бота. */
+export async function fetchTelegramLink(token) {
+  const res = await fetch(`${API}/telegram-link`, {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) return null;
+  const data = await res.json();
+  return data.url;
 }
