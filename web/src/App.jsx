@@ -240,9 +240,12 @@ export default function App() {
    * в 05:19 показывался бы как дневной и попадал бы в счётчик «снов
    * днём», хотя это продолжение той же ночи.
    */
+  // state.profile, а НЕ profile: деструктуризация { profile, bias } идёт
+  // ниже по функции, и обращение к ней отсюда падает в мёртвую зону
+  // объявления — сборка такое не ловит, приложение показывает пустой фон
   const nights = useMemo(
-    () => nightFragments(events, profile?.birth, tick),
-    [events, profile?.birth, tick]
+    () => nightFragments(events, state?.profile?.birth, tick),
+    [events, state?.profile?.birth, tick]
   );
   const active = events.find((e) => e.type === "sleep" && !e.end);
 
