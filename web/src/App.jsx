@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import {
   MIN, DAY, startOfDay, hhmm, dur, durShort, ageText, ageMonths, dayLabel,
-  sleepNorm, isNightSleep, predictNext, daySegments, dayStats, measureBias,
+  sleepNorm, isNightSleep, isNight, autoNight, nightFragments, predictNext, daySegments, dayStats, measureBias,
   medianNapIn, typicalNap, autoBias, settleOf, settleStats,
   settleShare, settleNudge, SETTLE_KINDS, SETTLE_LABEL, SETTLE_HINT, RAW_ALARM,
   selfCheck, biasProfile,
@@ -74,9 +74,9 @@ const DIAPER_LABEL = { wet: "Мокрый", dirty: "Стул", mixed: "Мокр�
 // Ветка по умолчанию раньше отсутствовала, и ЛЮБОЙ незнакомый тип
 // молча становился «Подгузник» — из-за этого запись о болезни
 // показывалась в дневнике как подгузник.
-const eventTitle = (e) =>
+const eventTitle = (e, nights) =>
   e.type === "sleep"
-    ? isNightSleep(e) ? "Ночной сон" : "Сон"
+    ? isNight(e, nights) ? "Ночной сон" : "Сон"
     : e.type === "feed"
     ? FEED_LABEL[e.meta?.kind] + (e.meta?.ml ? ` · ${e.meta.ml} мл` : "")
     : e.type === "diaper"
@@ -233,6 +233,17 @@ export default function App() {
   /* ---------- действия ---------- */
 
   const events = useMemo(() => liveEvents(state?.events || []), [state]);
+
+  /*
+   * Какие записи относятся к ночи с учётом склейки. Считается один раз
+   * на рендер и передаётся вниз: без этого сон в 05:45 после кормления
+   * в 05:19 показывался бы как дневной и попадал бы в счётчик «снов
+   * днём», хотя это продолжение той же ночи.
+   */
+  const nights = useMemo(
+    () => nightFragments(events, profile?.birth, tick),
+    [events, profile?.birth, tick]
+  );
   const active = events.find((e) => e.type === "sleep" && !e.end);
 
   const putEvent = (ev) =>
@@ -257,7 +268,7 @@ export default function App() {
   const logEvent = (type, meta) => {
     const ev = { id: uid(), type, start: Date.now(), end: Date.now(), meta };
     putEvent(ev);
-    flash(eventTitle(ev), () => putEvent({ ...ev, deleted: true }));
+    flash(eventTitle(ev, nights), () => putEvent({ ...ev, deleted: true }));
     setQuick(null);
     setTimeout(runSync, 800);
   };
@@ -406,7 +417,7 @@ export default function App() {
             <section className="bt-card">
               <div className="state">
                 <div className="state-label">
-                  {active ? (isNightSleep(active) ? "Ночной сон" : "Спит") : "Бодрствует"}
+                  {active ? (isNight(active, nights) ? "Ночной сон" : "Спит") : "Бодрствует"}
                 </div>
                 <div className="state-time bt-num">
                   {active ? dur(tick - active.start) : win ? dur(tick - win.wokeAt) : "—"}
@@ -427,7 +438,7 @@ export default function App() {
               </div>
 
               {win && <WindowBar win={win} now={tick} />}
-              {active && !isNightSleep(active) && (
+              {active && !isNight(active, nights) && (
                 <>
                   <NapNote start={active.start} now={tick} typical={napRef} />
                   <SettlePicker
@@ -469,12 +480,12 @@ export default function App() {
 
             <FeedNote events={events} profile={profile} now={tick} />
 
-            <Kpis stats={dayStats(events, todayStart)} title="Сегодня" />
+            <Kpis stats={dayStats(events, todayStart, nights)} title="Сегодня" />
           </>
         )}
 
         {tab === "day" && (
-          <DayView events={events} offset={offset} setOffset={setOffset} onPick={setEditing} />
+          <DayView events={events} nights={nights} offset={offset} setOffset={setOffset} onPick={setEditing} />
         )}
 
         {IND[tab] && (
@@ -483,7 +494,7 @@ export default function App() {
         )}
 
         {tab === "week" && (
-          <WeekView state={state} events={events} update={update}
+          <WeekView state={state} events={events} nights={nights} update={update}
             onSaveIllness={saveIllness} onRemoveIllness={removeIllness} />
         )}
 
@@ -500,6 +511,7 @@ export default function App() {
       {editing && (
         <EditSheet
           ev={events.find((e) => e.id === editing.id) || editing}
+          nights={nights}
           onShift={(field, m) => {
             const cur = events.find((e) => e.id === editing.id);
             if (cur) shift(cur, field, m);
@@ -514,6 +526,14 @@ export default function App() {
             if (!ind) return;
             const next = Math.min(Math.max((cur.meta?.[ind.metaKey] || 0) + d, ind.min), ind.max);
             putEvent({ ...cur, meta: { ...cur.meta, [ind.metaKey]: next } });
+          }}
+          onNight={(v) => {
+            const cur = events.find((e) => e.id === editing.id);
+            if (!cur) return;
+            const meta = { ...cur.meta };
+            if (v === null) delete meta.night;
+            else meta.night = v;
+            putEvent({ ...cur, meta });
           }}
           onDays={(d) => {
             const cur = events.find((e) => e.id === editing.id);
@@ -713,7 +733,7 @@ function NetLine({ net, pending, onRetry, onRelink }) {
 
 /* ================================================================== */
 
-function DayView({ events, offset, setOffset, onPick }) {
+function DayView({ events, nights, offset, setOffset, onPick }) {
   const dayStart = startOfDay(Date.now()) - offset * DAY;
   // отбор по пересечению с сутками, а не по времени начала: иначе
   // ночной сон, начатый вчера, даёт минуты в статистике, но не виден
@@ -726,7 +746,7 @@ function DayView({ events, offset, setOffset, onPick }) {
       return end >= dayStart && e.start < dayStart + DAY;
     })
     .sort((a, b) => b.start - a.start);
-  const s = dayStats(events, dayStart);
+  const s = dayStats(events, dayStart, nights);
 
   return (
     <>
@@ -757,7 +777,7 @@ function DayView({ events, offset, setOffset, onPick }) {
             <button className="row" key={e.id} onClick={() => onPick(e)}>
               <span className="dot" style={{ background: eventColor(e) }} />
               <span className="row-main">
-                <span className="row-t">{eventTitle(e)}</span>
+                <span className="row-t">{eventTitle(e, nights)}</span>
                 <span className="row-s bt-num">
                   {e.start < dayStart && "вчера "}
                   {hhmm(e.start)}{e.type === "sleep" && (e.end ? ` – ${hhmm(e.end)}` : " – сейчас")}
@@ -881,13 +901,13 @@ function IllnessCard({ periods, onSave, onRemove }) {
   );
 }
 
-function WeekView({ state, events, update, onSaveIllness, onRemoveIllness }) {
+function WeekView({ state, events, nights, update, onSaveIllness, onRemoveIllness }) {
   const [copied, setCopied] = useState(false);
   const [tgLink, setTgLink] = useState(null);
   const [tgErr, setTgErr] = useState(false);
   const today = startOfDay(Date.now());
   const days = Array.from({ length: 7 }, (_, i) => today - (6 - i) * DAY);
-  const stats = days.map((d) => dayStats(events, d));
+  const stats = days.map((d) => dayStats(events, d, nights));
   // Из средних выбрасываются обрезанные сутки: первый день ведения
   // дневника (он всегда начат с середины) и сегодняшний, который ещё
   // не закончился. Раньше сегодняшний считался как полный и занижал
@@ -903,8 +923,8 @@ function WeekView({ state, events, update, onSaveIllness, onRemoveIllness }) {
   const todayExcluded = drop.has(6);
   const avg = (f) => (counted.length ? counted.reduce((a, s) => a + f(s), 0) / counted.length : 0);
 
-  const napNow = medianNapIn(events, today - 6 * DAY, today + DAY);
-  const napBefore = medianNapIn(events, today - 13 * DAY, today - 6 * DAY);
+  const napNow = medianNapIn(events, today - 6 * DAY, today + DAY, nights);
+  const napBefore = medianNapIn(events, today - 13 * DAY, today - 6 * DAY, nights);
   const norm = sleepNorm(ageMonths(state.profile.birth, Date.now()));
   const weekEnd = today + DAY;
   const illnessEvents = events
@@ -1839,7 +1859,7 @@ function SettlePicker({ value, onPick, hint }) {
   );
 }
 
-function EditSheet({ ev, onShift, onMl, onValue, onDays, onSettle, onClose, onDelete }) {
+function EditSheet({ ev, nights, onShift, onMl, onValue, onDays, onNight, onSettle, onClose, onDelete }) {
   const ind = IND[ev.type];
   if (ind) {
     const [small, big] = ind.steps;
@@ -1880,8 +1900,27 @@ function EditSheet({ ev, onShift, onMl, onValue, onDays, onSettle, onClose, onDe
   return (
     <div className="sheet-bg" onClick={onClose}>
       <div className="sheet" onClick={(e) => e.stopPropagation()}>
-        <h3>{eventTitle(ev)}</h3>
+        <h3>{eventTitle(ev, nights)}</h3>
         <Stepper label="Начало" value={hhmm(ev.start)} onChange={(m) => onShift("start", m)} />
+        {ev.type === "sleep" && (
+          <>
+            <div className="field">
+              <span className="field-l">Это</span>
+              <div className="field-c">
+                {[[false, "Дневной"], [true, "Ночной"], [null, "Авто"]].map(([v, l]) => (
+                  <button key={String(v)}
+                    className={"nudge" + ((ev.meta?.night ?? null) === v ? " on" : "")}
+                    onClick={() => onNight(v)}>{l}</button>
+                ))}
+              </div>
+            </div>
+            <p className="hint">
+              {(ev.meta?.night ?? null) === null
+                ? `Авто: ${autoNight(ev, nights) ? "ночной" : "дневной"}. Приложение решает по непрерывности — если между снами было только кормление, считает продолжением ночи.`
+                : "Ваша пометка. Она сильнее автоматики: помеченный дневным сон приложение не склеит с ночным и посчитает отдельным окном бодрствования."}
+            </p>
+          </>
+        )}
         {ev.type === "sleep" && ev.end && (
           <>
             <Stepper label="Конец" value={hhmm(ev.end)} onChange={(m) => onShift("end", m)} />
@@ -1891,7 +1930,7 @@ function EditSheet({ ev, onShift, onMl, onValue, onDays, onSettle, onClose, onDe
             </div>
           </>
         )}
-        {ev.type === "sleep" && !isNightSleep(ev) && (
+        {ev.type === "sleep" && !isNight(ev, nights) && (
           <SettlePicker value={settleOf(ev)} onPick={onSettle} />
         )}
         {ev.type === "feed" && ev.meta?.kind === "formula" && (

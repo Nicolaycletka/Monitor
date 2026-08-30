@@ -120,6 +120,9 @@ const toClient = (r) => ({
 /** Виды уведомлений, известные серверу. Нужен только для валидации. */
 const KINDS = ["sleep", "feed"];
 
+/** Ближе этого к уже отправленному — то же самое напоминание, а не новое. */
+const RE_ARM_GAP_MS = 20 * 60000;
+
 /** Одно уведомление: null — снять, объект — поставить. */
 function putNotify(hid, kind, n) {
   if (n === null) return clearNotification.run(hid, kind);
@@ -131,6 +134,16 @@ function putNotify(hid, kind, n) {
   if (at <= now - 5 * 60000 || at >= now + 12 * 3600000) return;
   const current = getNotification.get(hid, kind);
   if (current && current.at === at) return; // уже стоит, не сбрасываем sent
+
+  /*
+   * Уведомление уже отправлено, а новое время рядом со старым — это не
+   * новое событие, а дрожание прогноза. Перевзводить нельзя: родитель
+   * получит второе такое же сообщение. Клиент округляет время до
+   * минуты, но округление не спасает, когда расчёт переползает через
+   * границу минуты, а прогноз между тем шевелится и на пару минут.
+   * Разъехалось сильно — значит окно правда сдвинулось, взводим.
+   */
+  if (current && current.sent && Math.abs(current.at - at) < RE_ARM_GAP_MS) return;
   setNotification.run({
     id: hid,
     kind,

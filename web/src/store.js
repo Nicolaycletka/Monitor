@@ -161,6 +161,17 @@ export async function relink(state) {
 /** Насколько близко два напоминания считаются одним шумом. */
 const NOTIFY_MERGE_MIN = 20;
 
+/*
+ * Время напоминания округляется до минуты.
+ *
+ * Прогноз зависит от возраста в месяцах, то есть от текущего момента
+ * непрерывно: между двумя синхронизациями расчётное время уезжает на
+ * секунды. Сервер видел «другое» время, перевзводил уведомление со
+ * снятым флагом отправки, и сообщение уходило второй раз — с теми же
+ * границами окна. Секунды в напоминании всё равно ничего не значат.
+ */
+const toMinute = (ts) => Math.round(ts / 60000) * 60000;
+
 function computeNotify(state) {
   if (!state.profile?.birth) return null;
   const events = liveEvents(state.events || []);
@@ -175,7 +186,7 @@ function computeNotify(state) {
   const win = predictNext(events, birth, Date.now(), state.bias || 0);
   if (win && !win.stale) {
     sleepN = {
-      at: win.calm,
+      at: toMinute(win.calm),
       text: `🌙 Пора успокаиваться — окно сна ${hhmm(win.from)}–${hhmm(win.to)}`,
     };
   }
@@ -186,7 +197,7 @@ function computeNotify(state) {
     const who = name ? `${name} ` : "";
     const был = sex === "f" ? "ела" : "ел";
     feedN = {
-      at: f.at,
+      at: toMinute(f.at),
       text: `🍼 ${who}не ${был} ${durShort(f.sinceLabel * 60000)} — желудок свободен, ` +
         "сейчас возьмёт охотнее всего",
     };
