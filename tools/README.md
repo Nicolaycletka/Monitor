@@ -16,7 +16,7 @@
       --define:import.meta.env='{"BASE_URL":"/monitor/"}' \
       --external:react --external:react-dom --external:react-dom/client \
       --external:react/jsx-runtime --jsx=automatic --loader:.css=empty
-    node ../tools/smoke.mjs [путь-к-экспорту.json]
+    node --experimental-default-type=module ../tools/smoke.mjs [путь-к-экспорту.json]
 
 Код возврата 1, если в консоли были ошибки. «ПУСТО» в колонке
 размера — вкладка не отрисовалась.

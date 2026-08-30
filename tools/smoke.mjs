@@ -30,7 +30,7 @@ console.error = (...a) => { const s = a.map(String).join(" "); if (!/not wrapped
 
 const React = (await import("react")).default;
 const { createRoot } = await import("react-dom/client");
-const { default: App } = await import("../web/appbuild.mjs");
+const { default: App } = await import("./appbuild.mjs");
 const root = createRoot(document.getElementById("root"));
 root.render(React.createElement(App));
 const wait = (ms) => new Promise(r => setTimeout(r, ms));

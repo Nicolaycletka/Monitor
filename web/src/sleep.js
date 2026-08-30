@@ -427,14 +427,115 @@ export const WINDOW_FLOOR = 20;
  * Точка отсчёта — конец ночного сна, если он записан. Если нет,
  * берётся 07:00: грубо, но устойчиво.
  */
-export function predictWindow(events, birth, now, bias = 0, spread = 0) {
+/** Ниже этого числа наблюдений личная прямая не строится вовсе. */
+export const FIT_MIN_NAPS = 6;
+/** Вес личной прямой = n/(n+FIT_SHRINK). При 12 снах — половина. */
+export const FIT_SHRINK = 12;
+/** Глубина истории для подгонки, дни. */
+export const FIT_DAYS = 21;
+
+/** Прогресс дня для исторического сна — тот же расчёт, что в predictWindow. */
+function progressAt(sleeps, prev) {
+  const day0 = startOfDay(prev.end);
+  const nightsToday = sleeps.filter(
+    (x) => isNightSleep(x) && x.end >= day0 && x.end < day0 + 14 * 3600000 && x.end <= prev.end
+  );
+  const morning = nightsToday.length ? nightsToday[nightsToday.length - 1].end : day0 + 7 * 3600000;
+  const bedtime = day0 + 20 * 3600000;
+  return isNightSleep(prev) ? 0 : clamp01((prev.end - morning) / (bedtime - morning));
+}
+
+/**
+ * Собственное окно бодрствования ребёнка — прямая, а не одно число.
+ *
+ * Зачем это вместо аддитивной поправки. `autoBias` умеет двигать
+ * предсказание целиком, но не умеет менять его НАКЛОН. А на реальной
+ * истории оказалось, что таблица промахивается именно наклоном:
+ * она предсказывала окна 74–100 мин (размах 26) там, где фактические
+ * были 90–168 (размах 79) — то есть втрое уже реальности. Никакой
+ * сдвиг такого не лечит: утром модель предскажет поздно, вечером рано,
+ * и обе ошибки лягут в разброс, которым потом расширяется окно.
+ *
+ * Важнее того: расширять окно вместо того, чтобы целиться центром, —
+ * это вообще не работает как компенсация. Разброс считается через MAD,
+ * а MAD не меняется от сдвига: сколько поправку ни применяй, ширина
+ * не сузится ни на минуту. Ширина и центр были развязаны, и ширина
+ * просто фиксировала долг модели.
+ *
+ * Здесь подгоняется прямая `окно = a + b·прогресс_дня` по собственным
+ * дневным снам методом наименьших квадратов, и она даёт lo = a,
+ * hi = a + b вместо табличных. Тогда:
+ *   - центр целится в реальность формой, а не сдвигом;
+ *   - measureBias начинает мерить ОСТАТКИ относительно личной прямой,
+ *     а не расхождение с таблицей, и ширина окна впервые начинает
+ *     сужаться по мере того, как модель становится точнее.
+ *
+ * Подгонка идёт по `окно + вычет`, а не по голому окну: carryOver и
+ * штраф за короткий сон вычитаются из target уже после, и без
+ * возврата вычета личная прямая впитала бы их и применила дважды.
+ *
+ * Личная прямая не заменяет таблицу разом, а подмешивается с весом
+ * n/(n+FIT_SHRINK) — тот же приём усадки, что и в autoBias. При шести
+ * снах берётся треть, при двенадцати половина, при сорока — три
+ * четверти. Полностью таблица не отбрасывается никогда: две недели
+ * дневника это всё ещё две недели.
+ */
+export function personalWindow(events, birth, now = Date.now()) {
+  if (!Number.isFinite(birth)) return null;
+  const sleeps = mergeSleeps(healthySleeps(events), birth).sort((a, b) => a.start - b.start);
+  const pts = [];
+  for (let i = 1; i < sleeps.length; i++) {
+    const cur = sleeps[i], prev = sleeps[i - 1];
+    if (isNightSleep(cur)) continue;             // предсказываем засыпание на ДНЕВНОЙ сон
+    if (now - cur.start > FIT_DAYS * DAY) continue;
+    if (settleOf(cur) === "hard") continue;      // засыпание с плачем — след опоздания
+    const awake = (cur.start - prev.end) / MIN;
+    if (!(awake > 5 && awake < 360)) continue;
+
+    const hist = sleeps.slice(0, i);
+    let shortPenalty = 0;
+    if (!isNightSleep(prev)) {
+      const len = (prev.end - prev.start) / MIN;
+      const ref = typicalNap(hist, prev.start, 10, birth);
+      if (ref != null) shortPenalty = 15 * clamp01((ref - len) / (ref * 0.3));
+    }
+    const reduction = Math.max(carryOver(hist), shortPenalty);
+    pts.push({ p: progressAt(sleeps, prev), y: awake + reduction });
+  }
+  if (pts.length < FIT_MIN_NAPS) return null;
+
+  const n = pts.length;
+  const sp = pts.reduce((a, q) => a + q.p, 0);
+  const sy = pts.reduce((a, q) => a + q.y, 0);
+  const spp = pts.reduce((a, q) => a + q.p * q.p, 0);
+  const spy = pts.reduce((a, q) => a + q.p * q.y, 0);
+  const den = n * spp - sp * sp;
+  // все наблюдения пришлись на одно время дня — наклон не измерен,
+  // берём только уровень: горизонтальная прямая честнее выдуманного наклона
+  const b = Math.abs(den) < 1e-6 ? 0 : (n * spy - sp * sy) / den;
+  const a = (sy - b * sp) / n;
+  return { n, lo: a, hi: a + b };
+}
+
+export function predictWindow(events, birth, now, bias = 0, spread = 0, opts = {}) {
   // склеенные периоды: фрагмент ночи не должен становиться «последним
   // сном», от конца которого отсчитывается окно
   const sleeps = mergeSleeps(events, birth).sort((a, b) => a.end - b.end);
   const last = sleeps[sleeps.length - 1];
   if (!last) return null;
 
-  const [lo, hi] = baseWindow(ageMonths(birth, now));
+  const [tableLo, tableHi] = baseWindow(ageMonths(birth, now));
+  // personal !== false — личная прямая по умолчанию включена; selfCheck
+  // выключает её, чтобы иметь чем сравнивать, и predictNext — если она
+  // проигрывает голой таблице
+  const fit = opts.personal === false ? null : personalWindow(events, birth, now);
+  const fitWeight = fit ? fit.n / (fit.n + FIT_SHRINK) : 0;
+  let lo = tableLo + ((fit ? fit.lo : tableLo) - tableLo) * fitWeight;
+  let hi = tableHi + ((fit ? fit.hi : tableHi) - tableHi) * fitWeight;
+  // подгонка по десятку точек может дать что угодно, включая
+  // отрицательный наклон и окно в четыре часа — держим в рамках
+  lo = Math.min(Math.max(lo, 30), 300);
+  hi = Math.min(Math.max(hi, lo + 10), 360);
   const day0 = startOfDay(last.end);
 
   // Циркадный ритм складывается к 6-12 неделям, суточная выработка
@@ -566,7 +667,9 @@ export function predictWindow(events, birth, now, bias = 0, spread = 0) {
     remaining,
     progress,
     appliedBias: bias,
-    range: [lo, hi],
+    range: [Math.round(lo), Math.round(hi)],
+    tableRange: [tableLo, tableHi],
+    fit: fit ? { ...fit, weight: fitWeight } : null,
     circadian,
     circadianWeight: cw,
     knownMorning: circadian ? knownMorning : true,
@@ -976,7 +1079,7 @@ function computeSelfCheck(events, birth, now) {
         : prof + shift;
 
     const a = predictWindow(before, birth, at, corr, m ? m.spread : 0);
-    const b = predictWindow(before, birth, at, 0, 0);
+    const b = predictWindow(before, birth, at, 0, 0, { personal: false });
     if (!a || !b) continue;
     withCorr.push(Math.abs(at - (a.from + a.to) / 2) / MIN);
     bare.push(Math.abs(at - (b.from + b.to) / 2) / MIN);
@@ -1052,7 +1155,11 @@ export function predictNext(events, birth, now, manual = 0) {
     typeof auto === "object"
       ? { early: auto.early + shift, late: auto.late + shift }
       : auto + shift;
-  const w = predictWindow(events, birth, now, bias, off || !m ? 0 : m.spread);
+  // самопроверка провалена — снимаем ВСЮ обученную часть, включая
+  // личную прямую: иначе «выключено» означало бы только половину
+  const w = predictWindow(events, birth, now, bias, off || !m ? 0 : m.spread, {
+    personal: !off,
+  });
   return w && {
     ...w,
     autoBias: auto,
