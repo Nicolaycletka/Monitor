@@ -414,6 +414,14 @@ export function carryOver(events, tail = 10) {
 }
 
 /** Минимальный остаток окна: не говорить «класть немедленно» в момент пробуждения. */
+/**
+ * Полуширина окна, минуты. Соглашение, а не измеренная величина:
+ * окно в полчаса — это то, во что человек может целиться, готовя
+ * ребёнка ко сну. Меняя её, помните, что чем она меньше, тем строже
+ * счёт к алгоритму, и это единственное, ради чего её стоит менять.
+ */
+export const WINDOW_HALF = 15;
+
 export const WINDOW_FLOOR = 20;
 
 /**
@@ -517,7 +525,7 @@ export function personalWindow(events, birth, now = Date.now()) {
   return { n, lo: a, hi: a + b };
 }
 
-export function predictWindow(events, birth, now, bias = 0, spread = 0, opts = {}) {
+export function predictWindow(events, birth, now, bias = 0, opts = {}) {
   // склеенные периоды: фрагмент ночи не должен становиться «последним
   // сном», от конца которого отсчитывается окно
   const sleeps = mergeSleeps(events, birth).sort((a, b) => a.end - b.end);
@@ -637,12 +645,25 @@ export function predictWindow(events, birth, now, bias = 0, spread = 0, opts = {
   const reduction = Math.max(carry, shortPenalty);
   const remaining = Math.max(target - reduction, WINDOW_FLOOR);
 
-  // до трёх месяцев прогноз заведомо грубее — окно шире.
-  // Плюс расширение по измеренному разбросу засыпаний: если ребёнок
-  // ложится вразброс, узкое окно — это ложная точность. Приложение
-  // знает свой разброс, честнее его показать. Ограничено 15 минутами,
-  // иначе окно перестаёт что-либо означать.
-  const half = 25 + (12 - 25) * cw + Math.min(spread * 0.5, 15);
+  /*
+   * Ширина окна — КОНСТАНТА. Раньше она складывалась из возрастной
+   * добавки и измеренного разброса засыпаний, и это была ошибка
+   * замысла: окно расширялось ровно там, где модель хуже предсказывает.
+   *
+   * Так промах не компенсируется, а прячется. Хуже того, он не
+   * компенсируется даже арифметически: разброс считается через MAD,
+   * а MAD не меняется от сдвига — сколько поправку ни применяй, ширина
+   * не сузится. Ширина и центр были развязаны, и ширина молча
+   * фиксировала долг модели, вместо того чтобы этот долг был виден.
+   *
+   * Теперь окно всегда одной ширины, и попасть в него — задача
+   * алгоритма, а не границ. Цена решения честная и её надо знать:
+   * доля промахов выросла и стала видимой. Именно поэтому вместе
+   * с этим появился hitRate() — показатель качества, который раньше
+   * маскировался расширением.
+   */
+  const half = WINDOW_HALF;
+
   const from = last.end + (remaining - half) * MIN;
 
   // Фаза успокоения перед окном. Длительность — соглашение, а не
@@ -1078,8 +1099,8 @@ function computeSelfCheck(events, birth, now) {
         ? { early: prof.early + shift, late: prof.late + shift }
         : prof + shift;
 
-    const a = predictWindow(before, birth, at, corr, m ? m.spread : 0);
-    const b = predictWindow(before, birth, at, 0, 0, { personal: false });
+    const a = predictWindow(before, birth, at, corr);
+    const b = predictWindow(before, birth, at, 0, { personal: false });
     if (!a || !b) continue;
     withCorr.push(Math.abs(at - (a.from + a.to) / 2) / MIN);
     bare.push(Math.abs(at - (b.from + b.to) / 2) / MIN);
@@ -1140,6 +1161,52 @@ export function biasProfile(m, hardShare = null, alertShare = null) {
  * Отдельной функции effectiveBias больше нет — она дублировала эту
  * же сборку вторым куском кода, и разойтись они могли молча.
  */
+/**
+ * Доля попаданий в окно за последние дневные сны — и медианный промах.
+ *
+ * Появился вместе с постоянной шириной окна. Пока ширина росла вслед
+ * за разбросом, качество прогноза было не видно: окно всегда «почти
+ * попадало», просто расширяясь. Теперь промах виден, и его надо
+ * показывать честным числом, а не прятать обратно.
+ *
+ * Считается walk-forward, ровно той моделью, которая работает:
+ * для каждого сна прогноз строится только по данным до него.
+ */
+export function hitRate(events, birth, now = Date.now(), tail = 20) {
+  const sleeps = mergeSleeps(healthySleeps(events), birth).sort((a, b) => a.start - b.start);
+  const mine = { hits: 0, errs: [] };
+  const table = { hits: 0, errs: [] };
+  const from = Math.max(1, sleeps.length - tail);
+  for (let i = from; i < sleeps.length; i++) {
+    if (isNightSleep(sleeps[i])) continue;
+    const at = sleeps[i].start;
+    const before = sleeps.slice(0, i);
+    const a = predictNext(before, birth, at, 0);
+    // ровно то же окно, но без обученной части: личная прямая
+    // отключена, поправка не применяется
+    const b = predictWindow(before, birth, at, 0, { personal: false });
+    if (!a || !b) continue;
+    for (const [w, acc] of [[a, mine], [b, table]]) {
+      if (at >= w.from && at <= w.to) acc.hits += 1;
+      acc.errs.push(Math.abs(at - (w.from + w.to) / 2) / MIN);
+    }
+  }
+  if (mine.errs.length < MIN_SAMPLES) return null;
+  const n = mine.errs.length;
+  return {
+    n,
+    hits: mine.hits,
+    share: mine.hits / n,
+    miss: Math.round(median(mine.errs)),
+    tableHits: table.hits,
+    tableMiss: Math.round(median(table.errs)),
+    // ширина окна одинакова в обеих ветках, поэтому доли попаданий
+    // сравнимы напрямую — до фиксации ширины такое сравнение было
+    // бессмысленным: модель получала окно шире и «выигрывала» им
+    width: WINDOW_HALF * 2 + 1,
+  };
+}
+
 export function predictNext(events, birth, now, manual = 0) {
   const m = measureBias(events, birth);
   const { hardShare, alertShare } = settleShare(events, now, birth);
@@ -1157,9 +1224,7 @@ export function predictNext(events, birth, now, manual = 0) {
       : auto + shift;
   // самопроверка провалена — снимаем ВСЮ обученную часть, включая
   // личную прямую: иначе «выключено» означало бы только половину
-  const w = predictWindow(events, birth, now, bias, off || !m ? 0 : m.spread, {
-    personal: !off,
-  });
+  const w = predictWindow(events, birth, now, bias, { personal: !off });
   return w && {
     ...w,
     autoBias: auto,

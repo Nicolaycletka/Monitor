@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import {
   MIN, DAY, startOfDay, hhmm, dur, durShort, ageText, ageMonths, dayLabel,
-  sleepNorm, isNightSleep, isNight, autoNight, nightFragments, predictNext, daySegments, dayStats, measureBias,
+  sleepNorm, isNightSleep, isNight, autoNight, nightFragments, hitRate, predictNext, daySegments, dayStats, measureBias,
   medianNapIn, typicalNap, autoBias, settleOf, settleStats,
   settleShare, settleNudge, SETTLE_KINDS, SETTLE_LABEL, SETTLE_HINT, RAW_ALARM,
   selfCheck, biasProfile,
@@ -1216,6 +1216,9 @@ function WeekView({ state, events, nights, update, onSaveIllness, onRemoveIllnes
         </button>
       </div>
 
+      <div className="sec">Точность прогноза</div>
+      <QualityCard state={state} events={events} />
+
       <div className="sec">Кормления</div>
       <FeedModelCard state={state} events={events} />
 
@@ -1322,6 +1325,72 @@ function NotifyPrefs({ state, update }) {
           Выключено всё — бот останется привязанным, но писать не будет.
         </p>
       )}
+    </div>
+  );
+}
+
+/**
+ * Насколько прогноз попадает. Раньше этого числа не было и быть
+ * не могло: окно расширялось вслед за разбросом, то есть всегда
+ * «почти попадало». Ширина теперь постоянная, промах виден — значит
+ * его надо показывать, а не прятать.
+ */
+function QualityCard({ state, events }) {
+  const { profile } = state;
+  const q = hitRate(events, profile.birth, Date.now());
+  const check = selfCheck(events, profile.birth, Date.now());
+
+  if (!q) {
+    return (
+      <div className="bt-card">
+        <p className="hint" style={{ marginTop: 0 }}>
+          Наберётся несколько дневных снов — покажу, как часто прогноз
+          попадает в окно.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="bt-card">
+      <div className="kpi" style={{ margin: 0 }}>
+        <div>
+          <div className="kpi-v bt-num">{q.hits}/{q.n}</div>
+          <div className="kpi-l">попаданий — модель</div>
+        </div>
+        <div>
+          <div className="kpi-v bt-num">{q.tableHits}/{q.n}</div>
+          <div className="kpi-l">попаданий — таблица</div>
+        </div>
+        <div>
+          <div className="kpi-v bt-num">{q.miss}</div>
+          <div className="kpi-l">промах модели, мин</div>
+        </div>
+        <div>
+          <div className="kpi-v bt-num">{q.tableMiss}</div>
+          <div className="kpi-l">промах таблицы, мин</div>
+        </div>
+      </div>
+      <p className="hint">
+        Окно всегда шириной {q.width} минут — и у модели, и у таблицы, и в любом
+        возрасте. Оно не расширяется вслед за разбросом засыпаний. Раньше
+        расширялось, и промах от этого становился незаметен; заодно модель
+        получала окно шире таблицы и «выигрывала» им, так что сравнивать доли
+        попаданий было нельзя. Теперь ширина одна на обе ветки, и эти числа
+        сравнимы напрямую.
+      </p>
+      {check && check.failing && (
+        <p className="hint">
+          Самопроверка показывает, что таблица выигрывает, поэтому обученная
+          часть сейчас отключена — модель и таблица дают одно и то же.
+        </p>
+      )}
+      <p className="hint">
+        Смотреть стоит не на абсолютную долю — при окне в полчаса и
+        собственном разбросе засыпаний в те же полчаса половина промахов
+        неизбежна, — а на две вещи: насколько модель обгоняет таблицу и
+        растёт ли её отрыв по мере накопления дневника.
+      </p>
     </div>
   );
 }
