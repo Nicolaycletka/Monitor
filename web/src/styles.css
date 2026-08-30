@@ -173,3 +173,11 @@ button:focus-visible, input:focus-visible { outline: 2px solid #8a97e6; outline-
 .seg { display: flex; gap: 4px; background: #1b1826; border: 1px solid #2b2739; border-radius: 13px; padding: 4px; margin-bottom: 14px; }
 .seg-b { flex: 1; background: none; border: none; color: #7d7593; border-radius: 10px; padding: 9px 0; font-size: 14px; cursor: pointer; }
 .seg-b.on { background: #2b2739; color: #ede6ff; }
+
+/* сравнение источников прогноза */
+.srcs { margin: 2px 0 6px; }
+.src-h, .src-r { display: grid; grid-template-columns: 1fr auto auto; gap: 12px; padding: 8px 0; border-top: 1px solid #2b2739; font-size: 13px; }
+.src-h { border-top: none; color: #6f677f; font-size: 11px; letter-spacing: .06em; text-transform: uppercase; }
+.src-r { color: #a49cbb; }
+.src-r.on { color: #ede6ff; }
+.src-r.on span:first-child::before { content: "▸ "; color: #e8a33d; }

@@ -96,8 +96,45 @@ const WINDOW_ANCHORS = [
   [24, 300, 360],
 ];
 
-export function baseWindow(m) {
-  const a = WINDOW_ANCHORS;
+/**
+ * Таблицы окон бодрствования от популярных сервисов — как опубликованы,
+ * без усреднения и без правок. Нужны как соперники собственной модели:
+ * приложение считает прогноз по каждой и берёт ту, что за последние
+ * PICK_TAIL дневных снов промахивалась меньше.
+ *
+ * Смысл в том, что «наша таблица лучше» перестаёт быть допущением.
+ * Если чужая таблица на этом ребёнке точнее — пусть работает она.
+ *
+ * Узлы: [возраст в месяцах, минимум, максимум минут].
+ */
+export const TABLES = {
+  app: {
+    label: "Своя таблица",
+    note: "усреднённая, собрана из источников — см. раздел «Источники цифр»",
+    nodes: null, // WINDOW_ANCHORS, подставляется ниже
+  },
+  cara: {
+    label: "Taking Cara Babies",
+    note: "0–4 нед 30–60 мин, 4–12 нед 60–90, 3–4 мес 75–120, 5–7 мес 2–3 ч, 7–10 мес 2.5–3.5 ч, 11–14 мес 3–4 ч, 14–24 мес 4–6 ч",
+    // середины возрастных диапазонов, потому что таблица задана
+    // диапазонами возраста, а не точками
+    nodes: [[0.5, 30, 60], [2, 60, 90], [3.5, 75, 120], [6, 120, 180],
+            [8.5, 150, 210], [12.5, 180, 240], [19, 240, 360]],
+  },
+  huck: {
+    label: "Huckleberry",
+    note: "новорождённые 30–90 мин, 3 мес 60–120, 4 мес 90–150, 6 мес 2–3 ч, 12 мес 3.25–4 ч, 24 мес 5.5–6 ч",
+    nodes: [[0.5, 30, 90], [3, 60, 120], [4, 90, 150], [6, 120, 180],
+            [12, 195, 240], [24, 330, 360]],
+  },
+};
+
+/** Ключи таблиц и модели — порядок важен только для показа. */
+export const SOURCES = ["model", "app", "cara", "huck"];
+export const sourceLabel = (k) => (k === "model" ? "Алгоритм" : TABLES[k].label);
+
+export function baseWindow(m, table = "app") {
+  const a = (table !== "app" && TABLES[table]?.nodes) || WINDOW_ANCHORS;
   if (m <= a[0][0]) return [a[0][1], a[0][2]];
   const end = a[a.length - 1];
   if (m >= end[0]) return [end[1], end[2]];
@@ -414,6 +451,14 @@ export function carryOver(events, tail = 10) {
 }
 
 /** Минимальный остаток окна: не говорить «класть немедленно» в момент пробуждения. */
+/**
+ * Полуширина окна, минуты. Соглашение, а не измеренная величина:
+ * окно в полчаса — это то, во что человек может целиться, готовя
+ * ребёнка ко сну. Меняя её, помните, что чем она меньше, тем строже
+ * счёт к алгоритму, и это единственное, ради чего её стоит менять.
+ */
+export const WINDOW_HALF = 15;
+
 export const WINDOW_FLOOR = 20;
 
 /**
@@ -517,14 +562,15 @@ export function personalWindow(events, birth, now = Date.now()) {
   return { n, lo: a, hi: a + b };
 }
 
-export function predictWindow(events, birth, now, bias = 0, spread = 0, opts = {}) {
+export function predictWindow(events, birth, now, bias = 0, opts = {}) {
+  const tableKey = opts.table || "app";
   // склеенные периоды: фрагмент ночи не должен становиться «последним
   // сном», от конца которого отсчитывается окно
   const sleeps = mergeSleeps(events, birth).sort((a, b) => a.end - b.end);
   const last = sleeps[sleeps.length - 1];
   if (!last) return null;
 
-  const [tableLo, tableHi] = baseWindow(ageMonths(birth, now));
+  const [tableLo, tableHi] = baseWindow(ageMonths(birth, now), tableKey);
   // personal !== false — личная прямая по умолчанию включена; selfCheck
   // выключает её, чтобы иметь чем сравнивать, и predictNext — если она
   // проигрывает голой таблице
@@ -637,12 +683,25 @@ export function predictWindow(events, birth, now, bias = 0, spread = 0, opts = {
   const reduction = Math.max(carry, shortPenalty);
   const remaining = Math.max(target - reduction, WINDOW_FLOOR);
 
-  // до трёх месяцев прогноз заведомо грубее — окно шире.
-  // Плюс расширение по измеренному разбросу засыпаний: если ребёнок
-  // ложится вразброс, узкое окно — это ложная точность. Приложение
-  // знает свой разброс, честнее его показать. Ограничено 15 минутами,
-  // иначе окно перестаёт что-либо означать.
-  const half = 25 + (12 - 25) * cw + Math.min(spread * 0.5, 15);
+  /*
+   * Ширина окна — КОНСТАНТА. Раньше она складывалась из возрастной
+   * добавки и измеренного разброса засыпаний, и это была ошибка
+   * замысла: окно расширялось ровно там, где модель хуже предсказывает.
+   *
+   * Так промах не компенсируется, а прячется. Хуже того, он не
+   * компенсируется даже арифметически: разброс считается через MAD,
+   * а MAD не меняется от сдвига — сколько поправку ни применяй, ширина
+   * не сузится. Ширина и центр были развязаны, и ширина молча
+   * фиксировала долг модели, вместо того чтобы этот долг был виден.
+   *
+   * Теперь окно всегда одной ширины, и попасть в него — задача
+   * алгоритма, а не границ. Цена решения честная и её надо знать:
+   * доля промахов выросла и стала видимой. Именно поэтому вместе
+   * с этим появился sourceScores() — показатель качества, который раньше
+   * маскировался расширением.
+   */
+  const half = WINDOW_HALF;
+
   const from = last.end + (remaining - half) * MIN;
 
   // Фаза успокоения перед окном. Длительность — соглашение, а не
@@ -669,6 +728,7 @@ export function predictWindow(events, birth, now, bias = 0, spread = 0, opts = {
     appliedBias: bias,
     range: [Math.round(lo), Math.round(hi)],
     tableRange: [tableLo, tableHi],
+    table: tableKey,
     fit: fit ? { ...fit, weight: fitWeight } : null,
     circadian,
     circadianWeight: cw,
@@ -1078,8 +1138,8 @@ function computeSelfCheck(events, birth, now) {
         ? { early: prof.early + shift, late: prof.late + shift }
         : prof + shift;
 
-    const a = predictWindow(before, birth, at, corr, m ? m.spread : 0);
-    const b = predictWindow(before, birth, at, 0, 0, { personal: false });
+    const a = predictWindow(before, birth, at, corr);
+    const b = predictWindow(before, birth, at, 0, { personal: false });
     if (!a || !b) continue;
     withCorr.push(Math.abs(at - (a.from + a.to) / 2) / MIN);
     bare.push(Math.abs(at - (b.from + b.to) / 2) / MIN);
@@ -1140,7 +1200,7 @@ export function biasProfile(m, hardShare = null, alertShare = null) {
  * Отдельной функции effectiveBias больше нет — она дублировала эту
  * же сборку вторым куском кода, и разойтись они могли молча.
  */
-export function predictNext(events, birth, now, manual = 0) {
+function modelWindow(events, birth, now, manual = 0) {
   const m = measureBias(events, birth);
   const { hardShare, alertShare } = settleShare(events, now, birth);
   const check = selfCheck(events, birth, now);
@@ -1157,9 +1217,7 @@ export function predictNext(events, birth, now, manual = 0) {
       : auto + shift;
   // самопроверка провалена — снимаем ВСЮ обученную часть, включая
   // личную прямую: иначе «выключено» означало бы только половину
-  const w = predictWindow(events, birth, now, bias, off || !m ? 0 : m.spread, {
-    personal: !off,
-  });
+  const w = predictWindow(events, birth, now, bias, { personal: !off });
   return w && {
     ...w,
     autoBias: auto,
@@ -1171,4 +1229,82 @@ export function predictNext(events, birth, now, manual = 0) {
     correctionsOff: off,
     sick: sickNow(events, now),
   };
+}
+
+/** Сколько последних дневных снов участвует в выборе источника. */
+export const PICK_TAIL = 10;
+/**
+ * Насколько чужая таблица должна обойти алгоритм, чтобы её взяли.
+ * Без запаса выбор скакал бы туда-сюда от случайного сна к сну:
+ * на десятке наблюдений разница в минуту — это шум, а не победа.
+ * По умолчанию работает алгоритм — он единственный, кто учится.
+ */
+export const PICK_MARGIN = 4;
+
+/** Окно по конкретному источнику: "model" или ключ таблицы. */
+export function windowBy(source, events, birth, now, manual = 0) {
+  if (source === "model") return modelWindow(events, birth, now, manual);
+  return predictWindow(events, birth, now, 0, { personal: false, table: source });
+}
+
+/**
+ * Насколько каждый источник промахивался на последних дневных снах.
+ * Walk-forward: для каждого сна прогноз строится только по данным
+ * до него. Ширина окна у всех источников одна и та же, поэтому доли
+ * попаданий сравнимы напрямую.
+ */
+export function sourceScores(events, birth, now = Date.now(), tail = PICK_TAIL) {
+  const sleeps = mergeSleeps(healthySleeps(events), birth).sort((a, b) => a.start - b.start);
+  const acc = {};
+  for (const k of SOURCES) acc[k] = { hits: 0, errs: [] };
+  const from = Math.max(1, sleeps.length - tail * 3);
+  let n = 0;
+  for (let i = from; i < sleeps.length; i++) {
+    if (isNightSleep(sleeps[i])) continue;
+    if (n >= tail) break;
+    const at = sleeps[i].start;
+    const before = sleeps.slice(0, i);
+    const ws = SOURCES.map((k) => windowBy(k, before, birth, at, 0));
+    if (ws.some((w) => !w)) continue;
+    ws.forEach((w, j) => {
+      const k = SOURCES[j];
+      if (at >= w.from && at <= w.to) acc[k].hits += 1;
+      acc[k].errs.push(Math.abs(at - (w.from + w.to) / 2) / MIN);
+    });
+    n += 1;
+  }
+  if (n < MIN_SAMPLES) return null;
+  return SOURCES.map((k) => ({
+    key: k,
+    label: sourceLabel(k),
+    n,
+    hits: acc[k].hits,
+    miss: Math.round(median(acc[k].errs)),
+  }));
+}
+
+/**
+ * Какой источник использовать для следующего прогноза.
+ *
+ * Побеждает наименьший медианный промах, но алгоритм держит фору
+ * PICK_MARGIN минут: он единственный, кто учится на этом ребёнке,
+ * и менять его на статичную таблицу из-за минутного перевеса на
+ * десяти наблюдениях — это выучить шум. Выбор без памяти, только
+ * по цифрам: одни и те же данные всегда дают один и тот же ответ.
+ */
+export function pickSource(events, birth, now = Date.now()) {
+  const sc = sourceScores(events, birth, now);
+  if (!sc) return { key: "model", scores: null, reason: "мало наблюдений" };
+  const model = sc.find((x) => x.key === "model");
+  const best = sc.filter((x) => x.key !== "model").sort((a, b) => a.miss - b.miss)[0];
+  if (best && best.miss + PICK_MARGIN < model.miss) {
+    return { key: best.key, scores: sc, reason: "таблица точнее с запасом" };
+  }
+  return { key: "model", scores: sc, reason: "алгоритм не хуже" };
+}
+
+export function predictNext(events, birth, now, manual = 0) {
+  const pick = pickSource(events, birth, now);
+  const w = windowBy(pick.key, events, birth, now, manual);
+  return w && { ...w, source: pick.key, sourcePick: pick };
 }

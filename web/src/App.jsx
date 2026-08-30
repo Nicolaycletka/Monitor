@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import {
   MIN, DAY, startOfDay, hhmm, dur, durShort, ageText, ageMonths, dayLabel,
-  sleepNorm, isNightSleep, isNight, autoNight, nightFragments, predictNext, daySegments, dayStats, measureBias,
+  sleepNorm, isNightSleep, isNight, autoNight, nightFragments, sourceScores, pickSource, sourceLabel, TABLES, PICK_MARGIN, predictNext, daySegments, dayStats, measureBias,
   medianNapIn, typicalNap, autoBias, settleOf, settleStats,
   settleShare, settleNudge, SETTLE_KINDS, SETTLE_LABEL, SETTLE_HINT, RAW_ALARM,
   selfCheck, biasProfile,
@@ -17,6 +17,7 @@ import {
 } from "./growth.js";
 import {
   predictFeed, perFeedMl, isDaytime, HALF_LIFE, READY_FRACTION,
+  breastVolume, typicalFeedMinutes, LETDOWN_TAU,
 } from "./feed.js";
 
 /**
@@ -66,9 +67,12 @@ const NOTIFY_KINDS = [
 ];
 
 const FEED_LABEL = {
-  left: "ГВ, левая", right: "ГВ, правая", formula: "Смесь",
-  solid: "Прикорм", water: "Вода",
+  breast: "Грудь", left: "ГВ, левая", right: "ГВ, правая",
+  formula: "Смесь", ebm: "Сцеженное молоко", solid: "Прикорм", water: "Вода",
 };
+
+/** Что предлагается по кнопке «Бутылочка». */
+const BOTTLE_KINDS = [["formula", "Смесь"], ["ebm", "Молоко"], ["water", "Вода"]];
 const DIAPER_LABEL = { wet: "Мокрый", dirty: "Стул", mixed: "Мокрый и стул" };
 
 // Ветка по умолчанию раньше отсутствовала, и ЛЮБОЙ незнакомый тип
@@ -78,7 +82,9 @@ const eventTitle = (e, nights) =>
   e.type === "sleep"
     ? isNight(e, nights) ? "Ночной сон" : "Сон"
     : e.type === "feed"
-    ? FEED_LABEL[e.meta?.kind] + (e.meta?.ml ? ` · ${e.meta.ml} мл` : "")
+    ? FEED_LABEL[e.meta?.kind] +
+      (e.meta?.ml ? ` · ${e.meta.ml} мл` : "") +
+      (Number.isFinite(e.meta?.sec) ? ` · ${Math.round(e.meta.sec / 60)} мин` : "")
     : e.type === "diaper"
     ? DIAPER_LABEL[e.meta?.kind] || "Подгузник"
     : e.type === "illness"
@@ -113,6 +119,7 @@ export default function App() {
   const [tick, setTick] = useState(Date.now());
   const [toast, setToast] = useState(null);
   const [quick, setQuick] = useState(null);
+  const [bottle, setBottle] = useState("formula");
   const [editing, setEditing] = useState(null);
   const [offset, setOffset] = useState(0);
   const [net, setNet] = useState({ status: "idle", error: null });
@@ -309,6 +316,33 @@ export default function App() {
 
   const shift = (ev, field, mins) => putEvent({ ...ev, [field]: ev[field] + mins * MIN });
 
+  /* ---------- кормление грудью по таймеру ---------- */
+
+  /*
+   * Незакрытое кормление — то же соглашение, что и у сна: end === null
+   * означает «идёт сейчас». Длительность на закрытии кладётся в
+   * meta.sec, а не выводится из end − start: запись потом можно
+   * подвинуть по времени, и длительность от этого меняться не должна.
+   */
+  const nursing = events.find(
+    (e) => e.type === "feed" && !e.end && !e.deleted && e.meta?.kind === "breast"
+  );
+
+  const toggleNursing = () => {
+    const now = Date.now();
+    if (nursing) {
+      const sec = Math.max(Math.round((now - nursing.start) / 1000), 30);
+      putEvent({ ...nursing, end: now, meta: { ...nursing.meta, sec } });
+      flash(`Грудь · ${Math.round(sec / 60)} мин`, () =>
+        putEvent({ ...nursing, end: null, meta: { kind: "breast" } }));
+    } else {
+      const ev = { id: uid(), type: "feed", start: now, end: null, meta: { kind: "breast" } };
+      putEvent(ev);
+      flash("Кормление грудью начато", () => putEvent({ ...ev, deleted: true }));
+    }
+    setTimeout(runSync, 800);
+  };
+
   /* ---------- антропометрия ---------- */
 
   const addMeasure = (ind, value, ts) => {
@@ -458,20 +492,46 @@ export default function App() {
             </section>
 
             <div className="quick">
-              <button className="qbtn" onClick={() => logEvent("feed", { kind: "left" })}>ГВ · левая</button>
-              <button className="qbtn" onClick={() => logEvent("feed", { kind: "right" })}>ГВ · правая</button>
-              <button className="qbtn" onClick={() => setQuick(quick === "formula" ? null : "formula")}>Смесь</button>
+              <button className={"qbtn" + (nursing ? " on" : "")} onClick={toggleNursing}>
+                {nursing ? `Грудь · ${durShort(tick - nursing.start)}` : "Грудь"}
+              </button>
+              <button className="qbtn" onClick={() => setQuick(quick === "bottle" ? null : "bottle")}>Бутылочка</button>
               <button className="qbtn" onClick={() => setQuick(quick === "diaper" ? null : "diaper")}>Подгузник</button>
             </div>
 
-            {quick === "formula" && (
-              <div className="chips">
-                {[30, 60, 90, 120, 150, 180, 210].map((ml) => (
-                  <button key={ml} className="chip" onClick={() => logEvent("feed", { kind: "formula", ml })}>{ml} мл</button>
-                ))}
-                <button className="chip" onClick={() => logEvent("feed", { kind: "solid" })}>Прикорм</button>
-                <button className="chip" onClick={() => logEvent("feed", { kind: "water" })}>Вода</button>
-              </div>
+            {nursing && (
+              <p className="hint">
+                Идёт кормление грудью, {durShort(tick - nursing.start)}. Нажмите
+                «Грудь» ещё раз, когда закончите, — приложение пересчитает
+                длительность в вероятный объём.
+              </p>
+            )}
+
+            {quick === "bottle" && (
+              <>
+                <div className="chips">
+                  {BOTTLE_KINDS.map(([k, l]) => (
+                    <button key={k}
+                      className={"chip" + (bottle === k ? " on" : "")}
+                      onClick={() => setBottle(k)}>{l}</button>
+                  ))}
+                </div>
+                <div className="chips">
+                  {[20, 30, 40, 60, 80, 100, 120, 150, 180].map((ml) => (
+                    <button key={ml} className="chip" onClick={() => {
+                      logEvent("feed", { kind: bottle, ml });
+                      setQuick(null);
+                    }}>{ml} мл</button>
+                  ))}
+                </div>
+                <p className="hint">
+                  {bottle === "ebm"
+                    ? "Сцеженное грудное молоко: объём известен точно, и опорожняется оно как грудное, а не как смесь."
+                    : bottle === "water"
+                    ? "Вода в расчёт наполнения желудка не идёт: уходит быстро и своих констант у нас для неё нет."
+                    : "Смесь задерживается в желудке дольше грудного молока — 65 минут против 47."}
+                </p>
+              </>
             )}
             {quick === "diaper" && (
               <div className="chips">
@@ -481,7 +541,7 @@ export default function App() {
               </div>
             )}
 
-            <FeedNote events={events} profile={profile} now={tick} />
+            <FeedNote events={events} profile={profile} now={tick} feedsPerDay={state.feedsPerDay ?? null} />
 
             <Kpis stats={dayStats(events, todayStart, nights)} title="Сегодня" />
           </>
@@ -1216,8 +1276,11 @@ function WeekView({ state, events, nights, update, onSaveIllness, onRemoveIllnes
         </button>
       </div>
 
+      <div className="sec">Точность прогноза</div>
+      <QualityCard state={state} events={events} />
+
       <div className="sec">Кормления</div>
-      <FeedModelCard state={state} events={events} />
+      <FeedModelCard state={state} events={events} update={update} />
 
       <div className="sec">Уведомления в Telegram</div>
       <div className="bt-card">
@@ -1326,11 +1389,83 @@ function NotifyPrefs({ state, update }) {
   );
 }
 
+/**
+ * Насколько прогноз попадает. Раньше этого числа не было и быть
+ * не могло: окно расширялось вслед за разбросом, то есть всегда
+ * «почти попадало». Ширина теперь постоянная, промах виден — значит
+ * его надо показывать, а не прятать.
+ */
+function QualityCard({ state, events }) {
+  const { profile } = state;
+  const now = Date.now();
+  const scores = sourceScores(events, profile.birth, now);
+  const pick = pickSource(events, profile.birth, now);
+
+  if (!scores) {
+    return (
+      <div className="bt-card">
+        <p className="hint" style={{ marginTop: 0 }}>
+          Наберётся несколько дневных снов — покажу, какой источник прогноза
+          точнее на вашем ребёнке.
+        </p>
+      </div>
+    );
+  }
+
+  const best = Math.min(...scores.map((r) => r.miss));
+
+  return (
+    <div className="bt-card">
+      <div className="srcs">
+        <div className="src-h">
+          <span>источник</span>
+          <span className="bt-num">попаданий</span>
+          <span className="bt-num">промах</span>
+        </div>
+        {scores.map((r) => (
+          <div className={"src-r" + (r.key === pick.key ? " on" : "")} key={r.key}>
+            <span>{r.label}</span>
+            <span className="bt-num">{r.hits}/{r.n}</span>
+            <span className="bt-num">{r.miss} мин</span>
+          </div>
+        ))}
+      </div>
+      <p className="hint">
+        Сейчас работает <b>{sourceLabel(pick.key)}</b>. Приложение считает
+        прогноз всеми четырьмя способами и берёт тот, что промахивался меньше
+        на последних {scores[0].n} дневных снах. Окно у всех одной ширины,
+        поэтому числа сравнимы напрямую.
+      </p>
+      <p className="hint">
+        Алгоритм держит фору в {PICK_MARGIN} минуты: он единственный, кто
+        учится на вашем ребёнке, и менять его на статичную таблицу из-за
+        минутного перевеса на десятке наблюдений значило бы выучить шум.
+        Выбор идёт только по цифрам и без памяти — одни и те же данные всегда
+        дают один и тот же ответ.
+      </p>
+      <p className="hint">
+        Чужие таблицы взяты как опубликованы, без усреднения и правок.{" "}
+        {TABLES.cara.label}: {TABLES.cara.note}. {TABLES.huck.label}:{" "}
+        {TABLES.huck.note}. Своя — {TABLES.app.note}.
+      </p>
+      <p className="hint">
+        Смотреть стоит не на абсолютную долю попаданий — при окне в полчаса
+        и собственном разбросе засыпаний в те же полчаса половина промахов
+        неизбежна, — а на то, растёт ли отрыв выбранного источника
+        от остальных{best === scores[0].miss ? "" : ""}.
+      </p>
+    </div>
+  );
+}
+
 /** Что именно приложение считает про кормления и на каких числах. */
-function FeedModelCard({ state, events }) {
+function FeedModelCard({ state, events, update }) {
   const { birth, sex } = state.profile;
-  const t = perFeedMl(events, birth, sex || null, Date.now());
-  const p = predictFeed(events, birth, sex || null, Date.now());
+  const manual = state.feedsPerDay ?? null;
+  const t = perFeedMl(events, birth, sex || null, Date.now(), manual);
+  const p = predictFeed(events, birth, sex || null, Date.now(), manual);
+  const setFeeds = (v) =>
+    update((st) => ({ ...st, feedsPerDay: v }));
 
   if (!t) {
     return (
@@ -1350,9 +1485,18 @@ function FeedModelCard({ state, events }) {
         <span className="field-v bt-num">{Math.round(t.daily)} мл</span>
       </div>
       <div className="field">
-        <span className="field-l">Кормлений в сутки (медиана)</span>
-        <span className="field-v bt-num">{t.feeds}</span>
+        <span className="field-l">Кормлений в сутки</span>
+        <div className="field-c">
+          <button className="nudge" onClick={() => setFeeds(Math.max((manual ?? t.feeds) - 1, 3))}>−1</button>
+          <span className="field-v bt-num">{t.feeds}</span>
+          <button className="nudge" onClick={() => setFeeds(Math.min((manual ?? t.feeds) + 1, 20))}>+1</button>
+        </div>
       </div>
+      <p className="hint" style={{ marginTop: 0 }}>
+        {manual
+          ? <>Значение задано вами. <button className="linkish" onClick={() => setFeeds(null)}>Вернуть автоматическое</button></>
+          : "Медиана по ПОЛНЫМ дням: тем, где есть кормление и до 9 утра, и после 19 вечера. Считать по числу записей нельзя — тогда «мало кормлений» и «мало отмечено» неразличимы, и неполные дни занижают медиану, а порция от этого завышается. Если знаете фактическое число — поправьте кнопками, расчёт пойдёт по нему."}
+      </p>
       <div className="field">
         <span className="field-l">Отсюда объём кормления</span>
         <span className="field-v bt-num">≈{Math.round(t.ml)} мл</span>
@@ -1377,6 +1521,22 @@ function FeedModelCard({ state, events }) {
         с 13C-октановой кислотой у доношенных). Разброс в исходном
         исследовании огромный, 16–86 и 27–98 минут, так что расчёт даёт
         порядок величины, а не минуты.
+      </p>
+      <p className="hint">
+        Кормление грудью записывается таймером, и длительность переводится
+        в объём насыщающей кривой <b>1 − exp(−t/{LETDOWN_TAU})</b>: молоко
+        уходит не равномерно, основная часть передаётся в первые минуты.
+        Постоянная времени подобрана так, чтобы к 10.5 минутам — средней
+        длительности кормления в исследовании с контрольным взвешиванием
+        доношенных — передавалось около 93 % объёма.
+        {t.refMin != null && <> Ваша медианная длительность — {Math.round(t.refMin)} мин,
+        при ней кривая даёт ровно типичный объём.</>}
+      </p>
+      <p className="hint">
+        Из литературы взята только ФОРМА кривой. Величина — своя: в том же
+        исследовании при средних 119.5 г на кормление разброс был 34–222 г,
+        то есть шестикратный, и брать оттуда абсолютные миллилитры
+        бессмысленно.
       </p>
       <p className="hint">
         Объём кормления для груди никто не измеряет — это главная слабость
@@ -1416,8 +1576,8 @@ function FeedModelCard({ state, events }) {
  * освободился ли желудок. Кормление по требованию этим подменять
  * нельзя, и сигналы ребёнка точнее любого расчёта.
  */
-function FeedNote({ events, profile, now }) {
-  const p = predictFeed(events, profile.birth, profile.sex || null, now);
+function FeedNote({ events, profile, now, feedsPerDay }) {
+  const p = predictFeed(events, profile.birth, profile.sex || null, now, feedsPerDay);
   if (!p) return null;
 
   if (p.empty) {

@@ -64,8 +64,17 @@ import { medianKg } from "./growth.js";
 /** Период полувыведения из желудка, минуты. */
 export const HALF_LIFE = { breast: 47, formula: 65 };
 
-/** Виды кормлений, которые вообще попадают в модель. */
-const MILK = new Set(["left", "right", "formula"]);
+/**
+ * Виды кормлений, которые попадают в модель.
+ *   breast        — грудь по таймеру, объём оценивается из длительности
+ *   left / right  — старые отметки без времени, читаются ради истории
+ *   formula       — смесь из бутылочки, объём введён
+ *   ebm           — сцеженное грудное молоко из бутылочки, объём введён
+ */
+const MILK = new Set(["breast", "left", "right", "formula", "ebm"]);
+
+/** Виды, у которых объём известен точно, а не оценивается. */
+const MEASURED = new Set(["formula", "ebm"]);
 
 /**
  * Прикорм и вода в модель не входят. Вода занимает объём, но уходит
@@ -119,13 +128,33 @@ export const dailyMl = (kg, ageDays) => kg * mlPerKg(ageDays);
  * Дни без единой записи выбрасываются: это дырка в дневнике,
  * а не сутки без еды.
  */
-export function typicalFeedCount(events, now = Date.now()) {
+/**
+ * День считается ПОЛНЫМ, если дневник покрывает оба его края: есть
+ * кормление до 9 утра и после 19 вечера. Считать по числу записей
+ * нельзя — тогда «мало кормлений» и «мало отмечено» неразличимы,
+ * а именно неполные дни и занижают медиану, из-за чего оценка
+ * порции завышалась.
+ */
+function isFullDay(events, from) {
+  let early = false, late = false;
+  for (const e of events) {
+    if (!isMilk(e) || e.deleted || e.start < from || e.start >= from + DAY) continue;
+    const h = new Date(e.start).getHours();
+    if (h < 9) early = true;
+    if (h >= 19) late = true;
+  }
+  return early && late;
+}
+
+export function typicalFeedCount(events, now = Date.now(), manual = null) {
+  if (Number.isFinite(manual) && manual > 0) return Math.min(Math.max(manual, 3), 20);
   const periods = illnessPeriods(events);
   const today = startOfDay(now);
   const counts = [];
   for (let i = 1; i <= 7; i += 1) {
     const from = today - i * DAY;
     if (isSickAt(from + DAY / 2, periods)) continue;
+    if (!isFullDay(events, from)) continue;
     const n = events.filter(
       (e) => isMilk(e) && !e.deleted && e.start >= from && e.start < from + DAY
     ).length;
@@ -139,34 +168,90 @@ export function typicalFeedCount(events, now = Date.now()) {
 }
 
 /** Оценка объёма одного кормления, мл. */
-export function perFeedMl(events, birth, sex, now = Date.now()) {
+export function perFeedMl(events, birth, sex, now = Date.now(), manualFeeds = null) {
   const w = weightKg(events, birth, sex, now);
   if (!w) return null;
-  const n = typicalFeedCount(events, now) || 8;
+  const n = typicalFeedCount(events, now, manualFeeds) || 8;
+  const refMin = typicalFeedMinutes(events, now);
   const ml = dailyMl(w.kg, (now - birth) / DAY) / n;
   return {
     ml: Math.min(Math.max(ml, 20), 200),
     feeds: n,
     kg: w.kg,
     measured: w.measured,
+    manual: Number.isFinite(manualFeeds) && manualFeeds > 0,
+    refMin,
     daily: dailyMl(w.kg, (now - birth) / DAY),
   };
 }
 
 /** Объём конкретного кормления: для смеси — введённый, иначе оценка. */
-const volumeOf = (e, typical) =>
-  e.meta?.kind === "formula" && Number.isFinite(e.meta?.ml) ? e.meta.ml : typical;
+/**
+ * Постоянная времени молокоотдачи, минуты.
+ *
+ * Молоко уходит не равномерно: основная часть передаётся в первые
+ * минуты, дальше кривая выполаживается. Форма взята как насыщающая
+ * экспонента `1 − exp(−t/τ)`. τ = 4 мин подобрана так, чтобы к 10.5
+ * минутам — средней длительности кормления в исследовании с
+ * контрольным взвешиванием доношенных — передавалось около 93 %
+ * от полного объёма.
+ *
+ * Сам масштаб из литературы НЕ берётся. В том же исследовании при
+ * средних 119.5 г на кормление разброс был 34–222 г, то есть
+ * шестикратный. Поэтому из литературы взята только форма кривой,
+ * а величина — собственная оценка ребёнка (суточный бюджет, делённый
+ * на число кормлений). Кормление типичной длительности даёт ровно
+ * типичный объём, короткое — меньше, длинное — чуть больше.
+ */
+export const LETDOWN_TAU = 4;
 
+/** Длительность кормления грудью, минуты, или null. */
+export const feedMinutes = (e) =>
+  Number.isFinite(e.meta?.sec) ? e.meta.sec / 60
+    : e.end && e.end > e.start ? (e.end - e.start) / MIN
+    : null;
+
+/**
+ * Объём кормления грудью по длительности. `ref` — своя медианная
+ * длительность: при ней возвращается ровно `typical`, чтобы оценка
+ * была привязана к собственным данным, а не к чужой средней.
+ */
+export function breastVolume(minutes, typical, ref) {
+  if (!(minutes > 0)) return typical;
+  const shape = (t) => 1 - Math.exp(-t / LETDOWN_TAU);
+  const base = shape(Math.min(Math.max(ref || 10.5, 3), 30));
+  return typical * (shape(Math.min(minutes, 40)) / base);
+}
+
+const volumeOf = (e, typical, refMin) => {
+  if (MEASURED.has(e.meta?.kind) && Number.isFinite(e.meta?.ml)) return e.meta.ml;
+  const min = feedMinutes(e);
+  return min == null ? typical : breastVolume(min, typical, refMin);
+};
+
+// сцеженное молоко опорожняется как грудное, а не как смесь
 const halfLifeOf = (e) => (e.meta?.kind === "formula" ? HALF_LIFE.formula : HALF_LIFE.breast);
 
+/** Своя медианная длительность кормления грудью, минуты. */
+export function typicalFeedMinutes(events, now = Date.now()) {
+  const xs = events
+    .filter((e) => isMilk(e) && !e.deleted && !MEASURED.has(e.meta?.kind) && e.start >= now - 14 * DAY)
+    .map(feedMinutes)
+    .filter((x) => x != null && x >= 1 && x <= 45)
+    .sort((a, b) => a - b);
+  if (xs.length < 3) return null;
+  const mid = xs.length >> 1;
+  return xs.length % 2 ? xs[mid] : (xs[mid - 1] + xs[mid]) / 2;
+}
+
 /** Сколько мл остаётся в желудке к моменту ts. */
-export function stomachAt(events, ts, typical) {
+export function stomachAt(events, ts, typical, refMin = null) {
   let sum = 0;
   for (const e of events) {
     if (!isMilk(e) || e.deleted || e.start > ts) continue;
     const mins = (ts - e.start) / MIN;
     if (mins > 480) continue; // за 8 часов остаётся меньше промилле
-    sum += volumeOf(e, typical) * Math.pow(0.5, mins / halfLifeOf(e));
+    sum += volumeOf(e, typical, refMin) * Math.pow(0.5, mins / halfLifeOf(e));
   }
   return sum;
 }
@@ -238,22 +323,22 @@ export const UNLOGGED_AWAKE_MIN = 90;
  *           пройдёт собственный типичный промежуток. Без второго
  *           условия напоминание приходило бы каждые полтора часа.
  */
-export function predictFeed(events, birth, sex, now = Date.now()) {
-  const typical = perFeedMl(events, birth, sex, now);
+export function predictFeed(events, birth, sex, now = Date.now(), manualFeeds = null) {
+  const typical = perFeedMl(events, birth, sex, now, manualFeeds);
   if (!typical) return null;
 
   const milk = events.filter((e) => isMilk(e) && !e.deleted).sort((a, b) => a.start - b.start);
   const lastFeed = milk.length ? milk[milk.length - 1] : null;
   if (!lastFeed) return { typical, lastFeed: null, empty: true };
 
-  const level = stomachAt(events, now, typical.ml);
+  const level = stomachAt(events, now, typical.ml, typical.refMin);
   const target = READY_FRACTION * typical.ml;
 
   let readyAt = now;
   if (level > target) {
     // шаг в 5 минут: точность модели такова, что минуты бессмысленны
     for (let t = now; t <= now + 8 * 3600000; t += 5 * MIN) {
-      if (stomachAt(events, t, typical.ml) <= target) { readyAt = t; break; }
+      if (stomachAt(events, t, typical.ml, typical.refMin) <= target) { readyAt = t; break; }
       readyAt = t;
     }
   }
@@ -300,8 +385,8 @@ export function predictFeed(events, birth, sex, now = Date.now()) {
  *   - дневник, похоже, неполный;
  *   - момент уже прошёл больше часа назад (клиент давно не открывали).
  */
-export function feedNotify(events, birth, sex, now = Date.now()) {
-  const p = predictFeed(events, birth, sex, now);
+export function feedNotify(events, birth, sex, now = Date.now(), manualFeeds = null) {
+  const p = predictFeed(events, birth, sex, now, manualFeeds);
   if (!p || p.empty || p.stale || p.asleep) return null;
   if (!isDaytime(p.dueAt)) return null;
   if (p.dueAt < now - 60 * MIN) return null;

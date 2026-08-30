@@ -72,6 +72,7 @@ export const emptyState = {
   rev: 0,             // курсор сервера
   bias: 0,            // ручная добавка к поправке, минуты
   schema: STATE_VERSION,
+  feedsPerDay: null,  // ручное число кормлений в сутки; null — считать самим
   biasResetFrom: null, // сколько сняли при миграции — показать один раз
   profileDirty: false,
 };
@@ -192,7 +193,7 @@ function computeNotify(state) {
   }
 
   let feedN = null;
-  const f = feedNotify(events, birth, sex || null, Date.now());
+  const f = feedNotify(events, birth, sex || null, Date.now(), state.feedsPerDay ?? null);
   if (f) {
     const who = name ? `${name} ` : "";
     const был = sex === "f" ? "ела" : "ел";
