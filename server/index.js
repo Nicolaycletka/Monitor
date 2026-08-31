@@ -17,6 +17,7 @@ import {
   setNotification,
   clearNotification,
   markNotificationSent,
+  newerEventSince,
   dueNotifications,
   lastSleepEvent,
   linkTelegramChat,
@@ -149,6 +150,8 @@ function putNotify(hid, kind, n) {
     kind,
     at,
     text: String(n.text || "").slice(0, 300),
+    guard_type: typeof n.guardType === "string" ? n.guardType : null,
+    guard_after: Number.isFinite(n.guardAfter) ? Math.round(n.guardAfter) : null,
   });
 }
 
@@ -163,6 +166,8 @@ function applyNotify(hid, notify) {
     putNotify(hid, "sleep", {
       at: notify.at,
       text: `🌙 Пора успокаиваться — окно сна ${notify.fromLabel}–${notify.toLabel}`,
+      guardType: "sleep",
+      guardAfter: Date.now(),
     });
     return;
   }
@@ -330,6 +335,17 @@ if (telegramEnabled()) {
       // общая для всех видов, а не только для сна.
       const last = lastSleepEvent.get(n.id);
       if (last && last.finish === null) continue;
+
+      /*
+       * Прогноз мог устареть между постановкой и отправкой: ребёнка
+       * покормили, или родитель поправил запись задним числом. Телефон
+       * в это время мог быть выключен и ничего не пересчитать, поэтому
+       * проверка обязана быть здесь, а не только на клиенте.
+       */
+      if (n.guard_type && Number.isFinite(n.guard_after)) {
+        const changed = newerEventSince.get(n.id, n.guard_type, n.guard_after);
+        if (changed && changed.n > 0) continue;
+      }
 
       const chats = telegramChatsFor.all(n.id);
       if (!chats.length) continue;

@@ -1257,11 +1257,20 @@ export function sourceScores(events, birth, now = Date.now(), tail = PICK_TAIL) 
   const sleeps = mergeSleeps(healthySleeps(events), birth).sort((a, b) => a.start - b.start);
   const acc = {};
   for (const k of SOURCES) acc[k] = { hits: 0, errs: [] };
-  const from = Math.max(1, sleeps.length - tail * 3);
+  /*
+   * Берутся ПОСЛЕДНИЕ tail дневных снов. Здесь был баг: цикл шёл
+   * вперёд от начала истории и обрывался по счётчику, то есть брал
+   * ПЕРВЫЕ десять — и статистика переставала меняться навсегда,
+   * сколько бы новых снов ни добавлялось. Индексы собираются с конца
+   * и разворачиваются, чтобы порядок остался хронологическим.
+   */
+  const idx = [];
+  for (let i = sleeps.length - 1; i >= 1 && idx.length < tail; i--) {
+    if (!isNightSleep(sleeps[i])) idx.push(i);
+  }
+  idx.reverse();
   let n = 0;
-  for (let i = from; i < sleeps.length; i++) {
-    if (isNightSleep(sleeps[i])) continue;
-    if (n >= tail) break;
+  for (const i of idx) {
     const at = sleeps[i].start;
     const before = sleeps.slice(0, i);
     const ws = SOURCES.map((k) => windowBy(k, before, birth, at, 0));

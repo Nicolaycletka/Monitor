@@ -51,6 +51,11 @@ CREATE TABLE IF NOT EXISTS notifications (
   at            INTEGER NOT NULL,
   text          TEXT NOT NULL,
   sent          INTEGER NOT NULL DEFAULT 0,
+  -- на какой момент дневника рассчитано уведомление: если после него
+  -- появилась или изменилась запись того типа, что лежит в основе
+  -- расчёта, отправлять нельзя — прогноз устарел
+  guard_type    TEXT,
+  guard_after   INTEGER,
   PRIMARY KEY (household_id, kind)
 );
 
@@ -87,6 +92,12 @@ addColumn("sex", "TEXT");
  * молча выключенным.
  */
 addColumn("notify_off", "TEXT");
+
+// таблица notifications могла быть создана до появления охранных полей
+for (const [c, t] of [["guard_type", "TEXT"], ["guard_after", "INTEGER"]]) {
+  const has = db.prepare("PRAGMA table_info(notifications)").all().some((x) => x.name === c);
+  if (!has) db.exec(`ALTER TABLE notifications ADD COLUMN ${c} ${t}`);
+}
 
 /* ------------------------------------------------------------------ */
 
@@ -152,10 +163,11 @@ export const getNotification = db.prepare(
 );
 
 export const setNotification = db.prepare(`
-  INSERT INTO notifications (household_id, kind, at, text, sent)
-  VALUES (@id, @kind, @at, @text, 0)
+  INSERT INTO notifications (household_id, kind, at, text, sent, guard_type, guard_after)
+  VALUES (@id, @kind, @at, @text, 0, @guard_type, @guard_after)
   ON CONFLICT (household_id, kind) DO UPDATE SET
-    at = excluded.at, text = excluded.text, sent = 0
+    at = excluded.at, text = excluded.text, sent = 0,
+    guard_type = excluded.guard_type, guard_after = excluded.guard_after
 `);
 
 export const clearNotification = db.prepare(
@@ -173,12 +185,23 @@ export const markNotificationSent = db.prepare(
  * по краям, иначе "feed" совпал бы с "feeding".
  */
 export const dueNotifications = db.prepare(`
-  SELECT n.household_id AS id, n.kind, n.at, n.text
+  SELECT n.household_id AS id, n.kind, n.at, n.text, n.guard_type, n.guard_after
   FROM notifications n
   JOIN households h ON h.id = n.household_id
   WHERE n.sent = 0 AND n.at <= ?
     AND (h.notify_off IS NULL
          OR INSTR(',' || h.notify_off || ',', ',' || n.kind || ',') = 0)
+`);
+
+/*
+ * Появилась ли запись нужного типа новее, чем момент расчёта.
+ * Считает и НОВЫЕ записи, и правки старых: у правки тоже растёт
+ * updated_at, а исправленное задним числом кормление меняет прогноз
+ * ровно так же, как только что случившееся.
+ */
+export const newerEventSince = db.prepare(`
+  SELECT COUNT(*) AS n FROM events
+  WHERE household_id = ? AND type = ? AND deleted = 0 AND updated_at > ?
 `);
 
 export const lastSleepEvent = db.prepare(`

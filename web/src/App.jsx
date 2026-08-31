@@ -324,22 +324,32 @@ export default function App() {
    * meta.sec, а не выводится из end − start: запись потом можно
    * подвинуть по времени, и длительность от этого меняться не должна.
    */
-  const nursing = events.find(
+  // ВСЕ незакрытые, а не первая попавшаяся: если по любой причине
+  // открылось несколько, одна кнопка должна закрывать их разом,
+  // иначе таймер выглядит незакрываемым
+  const nursingAll = events.filter(
     (e) => e.type === "feed" && !e.end && !e.deleted && e.meta?.kind === "breast"
   );
+  const nursing = nursingAll[0] || null;
 
-  const toggleNursing = () => {
+  const startNursing = () => {
+    if (nursing) return; // второе открытое кормление не заводим
+    const ev = { id: uid(), type: "feed", start: Date.now(), end: null, meta: { kind: "breast" } };
+    putEvent(ev);
+    flash("Кормление грудью начато", () => putEvent({ ...ev, deleted: true }));
+    setTimeout(runSync, 800);
+  };
+
+  const stopNursing = () => {
+    if (!nursing) return;
     const now = Date.now();
-    if (nursing) {
-      const sec = Math.max(Math.round((now - nursing.start) / 1000), 30);
-      putEvent({ ...nursing, end: now, meta: { ...nursing.meta, sec } });
-      flash(`Грудь · ${Math.round(sec / 60)} мин`, () =>
-        putEvent({ ...nursing, end: null, meta: { kind: "breast" } }));
-    } else {
-      const ev = { id: uid(), type: "feed", start: now, end: null, meta: { kind: "breast" } };
-      putEvent(ev);
-      flash("Кормление грудью начато", () => putEvent({ ...ev, deleted: true }));
+    const snapshot = nursingAll.map((e) => ({ ...e }));
+    for (const e of nursingAll) {
+      const sec = Math.max(Math.round((now - e.start) / 1000), 30);
+      putEvent({ ...e, end: now, meta: { ...e.meta, sec } });
     }
+    const sec = Math.max(Math.round((now - nursing.start) / 1000), 30);
+    flash(`Грудь · ${Math.round(sec / 60)} мин`, () => snapshot.forEach(putEvent));
     setTimeout(runSync, 800);
   };
 
@@ -492,7 +502,8 @@ export default function App() {
             </section>
 
             <div className="quick">
-              <button className={"qbtn" + (nursing ? " on" : "")} onClick={toggleNursing}>
+              <button className={"qbtn" + (nursing ? " on" : "")}
+                onClick={nursing ? stopNursing : startNursing}>
                 {nursing ? `Грудь · ${durShort(tick - nursing.start)}` : "Грудь"}
               </button>
               <button className="qbtn" onClick={() => setQuick(quick === "bottle" ? null : "bottle")}>Бутылочка</button>
@@ -500,11 +511,16 @@ export default function App() {
             </div>
 
             {nursing && (
-              <p className="hint">
-                Идёт кормление грудью, {durShort(tick - nursing.start)}. Нажмите
-                «Грудь» ещё раз, когда закончите, — приложение пересчитает
-                длительность в вероятный объём.
-              </p>
+              <>
+                <button className="big wake" onClick={stopNursing}>
+                  Закончить кормление · {durShort(tick - nursing.start)}
+                </button>
+                <p className="hint">
+                  Длительность пересчитается в вероятный объём.
+                  {nursingAll.length > 1 &&
+                    ` Открытых кормлений ${nursingAll.length} — закроются все разом.`}
+                </p>
+              </>
             )}
 
             {quick === "bottle" && (

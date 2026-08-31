@@ -188,6 +188,10 @@ function computeNotify(state) {
   if (win && !win.stale) {
     sleepN = {
       at: toMinute(win.calm),
+      // на что опирался расчёт: появится новая или исправленная запись
+      // сна — сервер отменит отправку сам, даже если телефон выключен
+      guardType: "sleep",
+      guardAfter: Date.now(),
       text: `🌙 Пора успокаиваться — окно сна ${hhmm(win.from)}–${hhmm(win.to)}`,
     };
   }
@@ -199,6 +203,8 @@ function computeNotify(state) {
     const был = sex === "f" ? "ела" : "ел";
     feedN = {
       at: toMinute(f.at),
+      guardType: "feed",
+      guardAfter: Date.now(),
       text: `🍼 ${who}не ${был} ${durShort(f.sinceLabel * 60000)} — желудок свободен, ` +
         "сейчас возьмёт охотнее всего",
     };
