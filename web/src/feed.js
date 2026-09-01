@@ -168,20 +168,33 @@ export function typicalFeedCount(events, now = Date.now(), manual = null) {
 }
 
 /** Оценка объёма одного кормления, мл. */
-export function perFeedMl(events, birth, sex, now = Date.now(), manualFeeds = null) {
+/**
+ * Объём одного кормления. По умолчанию — суточный бюджет по возрасту
+ * и весу, делённый на медиану числа кормлений. Если задано `pumpMl` —
+ * измеренный объём сцеживания одной груди утром — он становится
+ * основой оценки напрямую (см. пояснение и оговорки в App.jsx рядом
+ * с полем ввода): это не пересчёт по формуле, а замена расчётной
+ * величины на измеренную, ровно как просил родитель.
+ */
+export function perFeedMl(events, birth, sex, now = Date.now(), manualFeeds = null, pumpMl = null) {
   const w = weightKg(events, birth, sex, now);
   if (!w) return null;
   const n = typicalFeedCount(events, now, manualFeeds) || 8;
   const refMin = typicalFeedMinutes(events, now);
-  const ml = dailyMl(w.kg, (now - birth) / DAY) / n;
+  const daily = dailyMl(w.kg, (now - birth) / DAY);
+  const computedMl = daily / n;
+  const pumpBased = Number.isFinite(pumpMl) && pumpMl > 0;
+  const ml = pumpBased ? pumpMl : computedMl;
   return {
-    ml: Math.min(Math.max(ml, 20), 200),
+    ml: Math.min(Math.max(ml, 20), 250),
     feeds: n,
     kg: w.kg,
     measured: w.measured,
     manual: Number.isFinite(manualFeeds) && manualFeeds > 0,
     refMin,
-    daily: dailyMl(w.kg, (now - birth) / DAY),
+    daily,
+    computedMl: Math.min(Math.max(computedMl, 20), 200),
+    pumpBased,
   };
 }
 
@@ -223,11 +236,33 @@ export function breastVolume(minutes, typical, ref) {
   return typical * (shape(Math.min(minutes, 40)) / base);
 }
 
-const volumeOf = (e, typical, refMin) => {
+export const volumeOf = (e, typical, refMin) => {
   if (MEASURED.has(e.meta?.kind) && Number.isFinite(e.meta?.ml)) return e.meta.ml;
   const min = feedMinutes(e);
   return min == null ? typical : breastVolume(min, typical, refMin);
 };
+
+/**
+ * Съеденный объём за сутки, мл. Использует ТЕ ЖЕ typical/refMin, что
+ * и остальная модель (perFeedMl), а не пересчитывает их заново на
+ * каждый день недели — иначе цифры за разные дни считались бы разными
+ * весами и были бы несравнимы между собой.
+ *
+ * Вода и прикорм не входят: объём воды не переводится в мл надёжно
+ * (её не приходится оценивать по длительности), а прикорм не имеет
+ * общей единицы измерения с молоком.
+ */
+export function dayFeedMl(events, dayStart, typicalMl, refMin) {
+  const dayEnd = dayStart + DAY;
+  let ml = 0, n = 0;
+  for (const e of events) {
+    if (!isMilk(e) || e.deleted) continue;
+    if (e.start < dayStart || e.start >= dayEnd) continue;
+    ml += volumeOf(e, typicalMl, refMin);
+    n += 1;
+  }
+  return { ml: Math.round(ml), n };
+}
 
 // сцеженное молоко опорожняется как грудное, а не как смесь
 const halfLifeOf = (e) => (e.meta?.kind === "formula" ? HALF_LIFE.formula : HALF_LIFE.breast);
@@ -323,8 +358,8 @@ export const UNLOGGED_AWAKE_MIN = 90;
  *           пройдёт собственный типичный промежуток. Без второго
  *           условия напоминание приходило бы каждые полтора часа.
  */
-export function predictFeed(events, birth, sex, now = Date.now(), manualFeeds = null) {
-  const typical = perFeedMl(events, birth, sex, now, manualFeeds);
+export function predictFeed(events, birth, sex, now = Date.now(), manualFeeds = null, pumpMl = null) {
+  const typical = perFeedMl(events, birth, sex, now, manualFeeds, pumpMl);
   if (!typical) return null;
 
   const milk = events.filter((e) => isMilk(e) && !e.deleted).sort((a, b) => a.start - b.start);
@@ -385,8 +420,8 @@ export function predictFeed(events, birth, sex, now = Date.now(), manualFeeds = 
  *   - дневник, похоже, неполный;
  *   - момент уже прошёл больше часа назад (клиент давно не открывали).
  */
-export function feedNotify(events, birth, sex, now = Date.now(), manualFeeds = null) {
-  const p = predictFeed(events, birth, sex, now, manualFeeds);
+export function feedNotify(events, birth, sex, now = Date.now(), manualFeeds = null, pumpMl = null) {
+  const p = predictFeed(events, birth, sex, now, manualFeeds, pumpMl);
   if (!p || p.empty || p.stale || p.asleep) return null;
   if (!isDaytime(p.dueAt)) return null;
   if (p.dueAt < now - 60 * MIN) return null;

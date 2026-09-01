@@ -92,9 +92,19 @@ addColumn("sex", "TEXT");
  * молча выключенным.
  */
 addColumn("notify_off", "TEXT");
+// ПДР — нужна для точного расчёта скачков развития у недоношенных;
+// без неё используется дата рождения (см. web/src/milestones.js)
+addColumn("due_at", "INTEGER");
 
 // таблица notifications могла быть создана до появления охранных полей
-for (const [c, t] of [["guard_type", "TEXT"], ["guard_after", "INTEGER"]]) {
+for (const [c, t] of [
+  ["guard_type", "TEXT"], ["guard_after", "INTEGER"],
+  // снимок ПДР/даты рождения на момент расчёта — для вида "dev":
+  // если родитель поправит ПДР, уже посчитанный по старой дате пуш
+  // не должен уйти. Отдельный механизм от guard_type/guard_after:
+  // тот сверяется с таблицей событий, а тут сверяется с профилем.
+  ["guard_due_at", "INTEGER"], ["guard_birth_at", "INTEGER"],
+]) {
   const has = db.prepare("PRAGMA table_info(notifications)").all().some((x) => x.name === c);
   if (!has) db.exec(`ALTER TABLE notifications ADD COLUMN ${c} ${t}`);
 }
@@ -121,6 +131,7 @@ export const updateProfile = db.prepare(`
   UPDATE households
   SET name = @name, birth = @birth, sex = COALESCE(@sex, sex),
       notify_off = COALESCE(@notify_off, notify_off),
+      due_at = @due_at,
       profile_updated_at = @updated_at
   WHERE id = @id AND profile_updated_at < @updated_at
 `);
@@ -163,11 +174,13 @@ export const getNotification = db.prepare(
 );
 
 export const setNotification = db.prepare(`
-  INSERT INTO notifications (household_id, kind, at, text, sent, guard_type, guard_after)
-  VALUES (@id, @kind, @at, @text, 0, @guard_type, @guard_after)
+  INSERT INTO notifications
+    (household_id, kind, at, text, sent, guard_type, guard_after, guard_due_at, guard_birth_at)
+  VALUES (@id, @kind, @at, @text, 0, @guard_type, @guard_after, @guard_due_at, @guard_birth_at)
   ON CONFLICT (household_id, kind) DO UPDATE SET
     at = excluded.at, text = excluded.text, sent = 0,
-    guard_type = excluded.guard_type, guard_after = excluded.guard_after
+    guard_type = excluded.guard_type, guard_after = excluded.guard_after,
+    guard_due_at = excluded.guard_due_at, guard_birth_at = excluded.guard_birth_at
 `);
 
 export const clearNotification = db.prepare(
@@ -199,6 +212,11 @@ export const dueNotifications = db.prepare(`
  * updated_at, а исправленное задним числом кормление меняет прогноз
  * ровно так же, как только что случившееся.
  */
+/** Текущие birth/due_at семьи — снимок для сверки перед отправкой "dev". */
+export const householdDates = db.prepare(
+  "SELECT birth, due_at FROM households WHERE id = ?"
+);
+
 export const newerEventSince = db.prepare(`
   SELECT COUNT(*) AS n FROM events
   WHERE household_id = ? AND type = ? AND deleted = 0 AND updated_at > ?

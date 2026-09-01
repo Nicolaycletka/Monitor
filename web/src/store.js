@@ -8,6 +8,7 @@
 
 import { predictNext, hhmm, durShort } from "./sleep.js";
 import { feedNotify } from "./feed.js";
+import { nextMilestone } from "./milestones.js";
 
 const DB_NAME = "baby-tracker";
 const STORE = "kv";
@@ -73,6 +74,8 @@ export const emptyState = {
   bias: 0,            // ручная добавка к поправке, минуты
   schema: STATE_VERSION,
   feedsPerDay: null,  // ручное число кормлений в сутки; null — считать самим
+  pumpMl: null,       // сцеживание одной груди утром, мл; null — считать по бюджету/числу кормлений
+  dueAt: null,        // ПДР — для точности скачков развития у недоношенных; null — считать от даты рождения
   biasResetFrom: null, // сколько сняли при миграции — показать один раз
   profileDirty: false,
 };
@@ -197,7 +200,7 @@ function computeNotify(state) {
   }
 
   let feedN = null;
-  const f = feedNotify(events, birth, sex || null, Date.now(), state.feedsPerDay ?? null);
+  const f = feedNotify(events, birth, sex || null, Date.now(), state.feedsPerDay ?? null, state.pumpMl ?? null);
   if (f) {
     const who = name ? `${name} ` : "";
     const был = sex === "f" ? "ела" : "ел";
@@ -220,7 +223,21 @@ function computeNotify(state) {
     feedN = null;
   }
 
-  return { sleep: sleepN, feed: feedN };
+  /*
+   * Вехи развития — календарь, а не прогноз: спящий ребёнок ничему не
+   * мешает, окно кормления рядом тоже не имеет значения, слияние
+   * с другими видами не нужно. Единственная защита — снимок дат,
+   * который сверяется на сервере перед отправкой (см. server/index.js).
+   */
+  const dev = nextMilestone(birth, state.profile?.dueAt ?? null, Date.now());
+  const devN = dev && {
+    at: dev.at,
+    text: `🌱 ${dev.text}`,
+    guardDueAt: state.profile?.dueAt ?? null,
+    guardBirthAt: birth,
+  };
+
+  return { sleep: sleepN, feed: feedN, dev: devN };
 }
 
 const stripLocal = (e) => ({
@@ -287,6 +304,7 @@ export async function syncOnce(state) {
       // как и sex: сервер старой версии этого поля не пришлёт —
       // тогда сохраняем локальный выбор, а не затираем его пустотой
       notifyOff: data.profile.notifyOff || profile?.notifyOff || [],
+      dueAt: data.profile.dueAt ?? profile?.dueAt ?? null,
       updatedAt: data.profile.updatedAt,
     };
     profileDirty = false;

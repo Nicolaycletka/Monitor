@@ -534,6 +534,7 @@ export function personalWindow(events, birth, now = Date.now()) {
     if (isNightSleep(cur)) continue;             // предсказываем засыпание на ДНЕВНОЙ сон
     if (now - cur.start > FIT_DAYS * DAY) continue;
     if (settleOf(cur) === "hard") continue;      // засыпание с плачем — след опоздания
+    if (isExternal(cur)) continue;                // родитель пометил: момент не оценивает прогноз
     const awake = (cur.start - prev.end) / MIN;
     if (!(awake > 5 && awake < 360)) continue;
 
@@ -824,18 +825,30 @@ export function medianNapIn(events, from, to, nights = null) {
  * в полчаса от одной отметки. По всем снам те же 5 плохих из 20 дают
  * −8 минут, и зависимость плавная.
  */
-export const SETTLE_KINDS = ["hard", "alert"];
-export const SETTLE_LABEL = { hard: "Плакал", alert: "Был бодрый" };
+export const SETTLE_KINDS = ["hard", "alert", "external"];
+export const SETTLE_LABEL = { hard: "Плакал", alert: "Был бодрый", external: "Внешняя причина" };
 export const SETTLE_HINT = {
   hard: "не мог уснуть, плакал — похоже, положили поздно",
   alert: "не хотел спать, был весёлый — похоже, положили рано",
+  external: "не уложили вовремя из-за внешних причин — прогноз был верным, момент не считаем",
 };
+
+/**
+ * "external" — отдельная категория, а не третье значение той же шкалы
+ * "рано/поздно". Родитель говорит: момент засыпания не отражает ни
+ * готовность ребёнка, ни промах прогноза — просто не вышло уложить
+ * (гости, дорога, что угодно). У "hard" и "alert" есть НАПРАВЛЕНИЕ
+ * (окно упущено в такую-то сторону), а у "external" направления нет —
+ * его нужно не переклассифицировать, а вычеркнуть из выборки везде,
+ * где считается точность и обучается форма окна.
+ */
+export const isExternal = (e) => settleOf(e) === "external";
 export const settleOf = (e) =>
   SETTLE_KINDS.includes(e?.meta?.settle) ? e.meta.settle : null;
 
 /** Сколько укладываний каждого вида за период. */
 export function settleStats(events, from, to, birth = null) {
-  const out = { hard: 0, alert: 0, unmarked: 0, marked: 0, total: 0 };
+  const out = { hard: 0, alert: 0, external: 0, unmarked: 0, marked: 0, total: 0 };
   for (const e of mergeSleeps(healthySleeps(events), birth)) {
     if (!e.end || isNightSleep(e)) continue;
     if (e.start < from || e.start >= to) continue;
@@ -902,6 +915,8 @@ export function measureBias(events, birth) {
     const before = sleeps.slice(0, i);
     const w = predictWindow(before, birth, sleeps[i].start, 0);
     if (!w) continue;
+    if (isExternal(sleeps[i])) continue; // не оценка прогноза — не считаем вовсе
+
     const d = (sleeps[i].start - (w.from + w.to) / 2) / MIN;
     rawDiffs.push(d);
 
@@ -1017,7 +1032,7 @@ export function autoBias(m, hardShare = null, alertShare = null) {
  */
 export function settleShare(events, now = Date.now(), birth = null) {
   const from = now - 7 * DAY;
-  let hard = 0, alert = 0, marked = 0, total = 0;
+  let hard = 0, alert = 0, external = 0, marked = 0, total = 0;
   for (const e of mergeSleeps(healthySleeps(events), birth)) {
     if (!e.end || isNightSleep(e)) continue;
     if (e.start < from) continue;
@@ -1027,12 +1042,14 @@ export function settleShare(events, now = Date.now(), birth = null) {
     marked++;
     if (k === "hard") hard++;
     else if (k === "alert") alert++;
+    else if (k === "external") external++;
   }
   // знаменатель — ВСЕ дневные сны, а не только размеченные (см. выше)
   const ok = total >= MIN_SAMPLES;
   return {
     hard,
     alert,
+    external,
     marked,
     total,
     hardShare: ok ? hard / total : null,
@@ -1271,6 +1288,9 @@ export function sourceScores(events, birth, now = Date.now(), tail = PICK_TAIL) 
   idx.reverse();
   let n = 0;
   for (const i of idx) {
+    // укладывание сорвано внешней причиной — момент не проверка прогноза,
+    // и его исключение относится ко всем четырём источникам одинаково
+    if (isExternal(sleeps[i])) continue;
     const at = sleeps[i].start;
     const before = sleeps.slice(0, i);
     const ws = SOURCES.map((k) => windowBy(k, before, birth, at, 0));

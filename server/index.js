@@ -18,6 +18,7 @@ import {
   clearNotification,
   markNotificationSent,
   newerEventSince,
+  householdDates,
   dueNotifications,
   lastSleepEvent,
   linkTelegramChat,
@@ -70,6 +71,8 @@ function auth(req, res, next) {
 r.post("/api/household", throttle, (req, res) => {
   const { name, birth } = req.body || {};
   const sex = req.body?.sex === "m" || req.body?.sex === "f" ? req.body.sex : null;
+  const dueAtRaw = Number(req.body?.dueAt);
+  const dueAt = Number.isFinite(dueAtRaw) ? dueAtRaw : null;
   if (typeof name !== "string" || !name.trim() || !Number.isFinite(birth)) {
     return res.status(400).json({ error: "bad_profile" });
   }
@@ -81,6 +84,7 @@ r.post("/api/household", throttle, (req, res) => {
     name: name.trim().slice(0, 60),
     birth,
     sex,
+    due_at: dueAt,
     profile_updated_at: Date.now(),
     created_at: Date.now(),
   });
@@ -119,7 +123,7 @@ const toClient = (r) => ({
 });
 
 /** Виды уведомлений, известные серверу. Нужен только для валидации. */
-const KINDS = ["sleep", "feed"];
+const KINDS = ["sleep", "feed", "dev"];
 
 /** Ближе этого к уже отправленному — то же самое напоминание, а не новое. */
 const RE_ARM_GAP_MS = 20 * 60000;
@@ -127,12 +131,38 @@ const RE_ARM_GAP_MS = 20 * 60000;
 /** Одно уведомление: null — снять, объект — поставить. */
 function putNotify(hid, kind, n) {
   if (n === null) return clearNotification.run(hid, kind);
-  if (!n || !Number.isFinite(n.at)) return;
+
+  /*
+   * БЫЛ БАГ: обе ветки ниже раньше просто делали `return`, оставляя
+   * старую запись в очереди нетронутой. Клиент пересчитывает окно на
+   * каждом синке, и стоит окну устареть (ребёнка покормили, момент
+   * прошёл) — новое вычисленное время становится "невалидным" по этим
+   * же проверкам, функция выходит НИЧЕГО не сделав, а прежняя,
+   * теперь неактуальная запись остаётся в очереди и рано или поздно
+   * улетает планировщиком. Именно так приходили неактуальные пуши:
+   * протухание не переносилось на сервер, потому что сервер о нём
+   * узнавал только через "новое валидное время", а протухание — это
+   * ОТСУТСТВИЕ валидного времени.
+   *
+   * Правило теперь простое: если новый расчёт не даёт валидного
+   * времени — значит слать нечего, и любая ждущая отправки запись
+   * снимается. Уже отправленную не трогаем: она уже уехала, и
+   * повторно её обнулять незачем.
+   */
+  if (!n || !Number.isFinite(n.at)) {
+    const cur = getNotification.get(hid, kind);
+    if (cur && !cur.sent) clearNotification.run(hid, kind);
+    return;
+  }
   const at = Math.round(n.at);
   const now = Date.now();
   // отбрасываем совсем старые (часы уехали) или неправдоподобно
   // далёкие метки — не даём битым клиентским данным что-то сломать
-  if (at <= now - 5 * 60000 || at >= now + 12 * 3600000) return;
+  if (at <= now - 5 * 60000 || at >= now + 12 * 3600000) {
+    const cur = getNotification.get(hid, kind);
+    if (cur && !cur.sent) clearNotification.run(hid, kind);
+    return;
+  }
   const current = getNotification.get(hid, kind);
   if (current && current.at === at) return; // уже стоит, не сбрасываем sent
 
@@ -152,6 +182,8 @@ function putNotify(hid, kind, n) {
     text: String(n.text || "").slice(0, 300),
     guard_type: typeof n.guardType === "string" ? n.guardType : null,
     guard_after: Number.isFinite(n.guardAfter) ? Math.round(n.guardAfter) : null,
+    guard_due_at: Number.isFinite(n.guardDueAt) ? Math.round(n.guardDueAt) : null,
+    guard_birth_at: Number.isFinite(n.guardBirthAt) ? Math.round(n.guardBirthAt) : null,
   });
 }
 
@@ -204,6 +236,7 @@ r.post("/api/sync", throttle, auth, (req, res) => {
         notify_off: Array.isArray(profile.notifyOff)
           ? profile.notifyOff.filter((k) => KINDS.includes(k)).join(",")
           : null,
+        due_at: Number.isFinite(profile.dueAt) ? Math.round(profile.dueAt) : null,
         updated_at: Number(profile.updatedAt),
       });
     }
@@ -225,7 +258,7 @@ r.post("/api/sync", throttle, auth, (req, res) => {
 
   const rows = eventsSince.all(hid, since);
   const current = db
-    .prepare("SELECT name, birth, sex, notify_off, profile_updated_at FROM households WHERE id = ?")
+    .prepare("SELECT name, birth, sex, notify_off, due_at, profile_updated_at FROM households WHERE id = ?")
     .get(hid);
 
   res.json({
@@ -236,6 +269,7 @@ r.post("/api/sync", throttle, auth, (req, res) => {
       birth: current.birth,
       sex: current.sex || null,
       notifyOff: current.notify_off ? current.notify_off.split(",") : [],
+      dueAt: current.due_at || null,
       updatedAt: current.profile_updated_at,
     },
     serverTime: Date.now(),
@@ -345,6 +379,20 @@ if (telegramEnabled()) {
       if (n.guard_type && Number.isFinite(n.guard_after)) {
         const changed = newerEventSince.get(n.id, n.guard_type, n.guard_after);
         if (changed && changed.n > 0) continue;
+      }
+
+      /*
+       * Отдельная сверка для вех развития: если родитель поправил ПДР
+       * или дату рождения ПОСЛЕ того, как был посчитан этот пуш, текст
+       * и момент могли устареть (скачок целиком считается от другой
+       * даты). Дневник тут ни при чём, поэтому это не newerEventSince,
+       * а прямое сравнение снимка с текущим значением в профиле.
+       */
+      if (n.kind === "dev") {
+        const now2 = householdDates.get(n.id);
+        if (now2 && ((now2.due_at || null) !== (n.guard_due_at || null) || now2.birth !== n.guard_birth_at)) {
+          continue;
+        }
       }
 
       const chats = telegramChatsFor.all(n.id);

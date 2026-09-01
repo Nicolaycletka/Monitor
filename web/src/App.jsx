@@ -17,8 +17,9 @@ import {
 } from "./growth.js";
 import {
   predictFeed, perFeedMl, isDaytime, HALF_LIFE, READY_FRACTION,
-  breastVolume, typicalFeedMinutes, LETDOWN_TAU,
+  breastVolume, typicalFeedMinutes, LETDOWN_TAU, dayFeedMl,
 } from "./feed.js";
+import { milestoneOverview } from "./milestones.js";
 
 /**
  * Как мерить — по одной подсказке на показатель. Для длины и головы
@@ -64,6 +65,7 @@ const SECTIONS = {
 const NOTIFY_KINDS = [
   ["sleep", "Пора укладывать", "Приходит в начале фазы успокоения, по прогнозу окна сна."],
   ["feed", "Можно кормить", "Приходит, когда желудок освободился и прошёл обычный для ребёнка промежуток. Только днём, с 7 до 22."],
+  ["dev", "Вехи развития", "Раз в одну-три недели — что ждать в этом месяце и скачки развития. Не диагностика, просто заметки для интереса."],
 ];
 
 const FEED_LABEL = {
@@ -557,7 +559,8 @@ export default function App() {
               </div>
             )}
 
-            <FeedNote events={events} profile={profile} now={tick} feedsPerDay={state.feedsPerDay ?? null} />
+            <FeedNote events={events} profile={profile} now={tick}
+              feedsPerDay={state.feedsPerDay ?? null} pumpMl={state.pumpMl ?? null} />
 
             <Kpis stats={dayStats(events, todayStart, nights)} title="Сегодня" />
           </>
@@ -598,6 +601,13 @@ export default function App() {
           onMl={(d) => {
             const cur = events.find((e) => e.id === editing.id);
             if (cur) putEvent({ ...cur, meta: { ...cur.meta, ml: Math.max(0, (cur.meta?.ml || 0) + d) } });
+          }}
+          onSeconds={(d) => {
+            const cur = events.find((e) => e.id === editing.id);
+            if (!cur) return;
+            // минимум 30 с — то же соглашение, что и при остановке таймера
+            const sec = Math.max((cur.meta?.sec || 0) + d, 30);
+            putEvent({ ...cur, meta: { ...cur.meta, sec } });
           }}
           onValue={(d) => {
             const cur = events.find((e) => e.id === editing.id);
@@ -987,6 +997,11 @@ function WeekView({ state, events, nights, update, onSaveIllness, onRemoveIllnes
   const today = startOfDay(Date.now());
   const days = Array.from({ length: 7 }, (_, i) => today - (6 - i) * DAY);
   const stats = days.map((d) => dayStats(events, d, nights));
+  const { birth, sex } = state.profile;
+  const feedModel = perFeedMl(events, birth, sex || null, Date.now(), state.feedsPerDay ?? null, state.pumpMl ?? null);
+  const foodStats = days.map((d) =>
+    feedModel ? dayFeedMl(events, d, feedModel.ml, feedModel.refMin) : null
+  );
   // Из средних выбрасываются обрезанные сутки: первый день ведения
   // дневника (он всегда начат с середины) и сегодняшний, который ещё
   // не закончился. Раньше сегодняшний считался как полный и занижал
@@ -1042,8 +1057,18 @@ function WeekView({ state, events, nights, update, onSaveIllness, onRemoveIllnes
           </span>
           <div className="week-rib"><Ribbon events={events} dayStart={d} height={16} /></div>
           <span className="week-tot bt-num">{stats[i].total ? durShort(stats[i].total) : "—"}</span>
+          <span className="week-food bt-num">
+            {foodStats[i]
+              ? foodStats[i].n ? `${foodStats[i].ml} мл` : "—"
+              : stats[i].feeds ? `${stats[i].feeds}×` : "—"}
+          </span>
         </div>
       ))}
+      <p className="hint" style={{ marginTop: -4 }}>
+        {feedModel
+          ? "Столбец еды — оценка объёма за сутки: точный для смеси и сцеженного молока, по длительности для кормлений грудью. Так же, как на вкладке «Сейчас»."
+          : "Столбец еды показывает число кормлений — для объёма в мл нужен пол ребёнка на вкладке «Вес»."}
+      </p>
 
       <div className="sec">
         В среднем за сутки{counted.length ? ` · ${counted.length} дн` : ""}
@@ -1298,6 +1323,9 @@ function WeekView({ state, events, nights, update, onSaveIllness, onRemoveIllnes
       <div className="sec">Кормления</div>
       <FeedModelCard state={state} events={events} update={update} />
 
+      <div className="sec">Вехи развития</div>
+      <MilestonesCard state={state} update={update} />
+
       <div className="sec">Уведомления в Telegram</div>
       <div className="bt-card">
         <p className="hint" style={{ marginTop: 0 }}>
@@ -1364,6 +1392,68 @@ function WeekView({ state, events, nights, update, onSaveIllness, onRemoveIllnes
  * Хранится список ОТКЛЮЧЁННЫХ видов: тогда вид, добавленный в будущей
  * версии, заработает сам, а не окажется молча выключенным.
  */
+/**
+ * ПДР и обзор вех развития.
+ *
+ * ПДР — необязательное поле, влияет только на расчёт СКАЧКОВ развития
+ * (по мотивам Wonder Weeks): исходная методика считает их строго от
+ * предполагаемой даты родов, а не от фактической — для родившихся
+ * не в срок это меняет момент скачка на недели. Ежемесячные вехи
+ * навыков всегда считаются от даты рождения, ПДР на них не влияет.
+ */
+function MilestonesCard({ state, update }) {
+  const { birth, dueAt } = state.profile;
+  const [raw, setRaw] = useState(dueAt ? toInput(dueAt) : "");
+  const ov = milestoneOverview(birth, dueAt ?? null, Date.now());
+
+  const setDue = (iso) =>
+    update((st) => ({
+      ...st,
+      profile: { ...st.profile, dueAt: iso ? noonOf(iso) : null, updatedAt: Date.now() },
+      profileDirty: true,
+    }));
+
+  return (
+    <div className="bt-card">
+      <div className="field">
+        <span className="field-l">ПДР (если знаете)</span>
+        <div className="field-c">
+          <input className="inp" type="date" value={raw}
+            onChange={(e) => { setRaw(e.target.value); setDue(e.target.value || null); }} />
+          {dueAt && (
+            <button className="linkish" onClick={() => { setRaw(""); setDue(null); }}>Убрать</button>
+          )}
+        </div>
+      </div>
+      <p className="hint" style={{ marginTop: 0 }}>
+        {dueAt
+          ? "Скачки развития считаются от ПДР — точнее для родившихся не в срок. Ежемесячные вехи навыков всё равно считаются от даты рождения."
+          : "Необязательно. Без ПДР скачки развития считаются от даты рождения — для родившегося в срок разницы почти нет, для недоношенного или переношенного она может достигать нескольких недель."}
+      </p>
+      {ov && (
+        <>
+          <div className="field">
+            <span className="field-l">Пройдено вех</span>
+            <span className="field-v bt-num">{ov.passed}/{ov.total}</span>
+          </div>
+          {ov.next && (
+            <p className="hint">
+              Ближайшее — {dayLabel(ov.next.at)}: «{ov.next.text.slice(0, 90)}…»
+            </p>
+          )}
+        </>
+      )}
+      <p className="hint">
+        Пуш приходит примерно раз в одну-три недели: ежемесячные заметки
+        о навыках и «красных флагах» (от фактической даты рождения) плюс
+        отдельно — скачки развития по неделям. Это не диагностика и не
+        предсказание вашего ребёнка конкретно — общие ориентиры для
+        интереса и повод спросить педиатра, если что-то настораживает.
+      </p>
+    </div>
+  );
+}
+
 function NotifyPrefs({ state, update }) {
   const off = state.profile?.notifyOff || [];
   const toggle = (kind) =>
@@ -1478,10 +1568,14 @@ function QualityCard({ state, events }) {
 function FeedModelCard({ state, events, update }) {
   const { birth, sex } = state.profile;
   const manual = state.feedsPerDay ?? null;
-  const t = perFeedMl(events, birth, sex || null, Date.now(), manual);
-  const p = predictFeed(events, birth, sex || null, Date.now(), manual);
+  const pumpMl = state.pumpMl ?? null;
+  const t = perFeedMl(events, birth, sex || null, Date.now(), manual, pumpMl);
+  const p = predictFeed(events, birth, sex || null, Date.now(), manual, pumpMl);
   const setFeeds = (v) =>
     update((st) => ({ ...st, feedsPerDay: v }));
+  const setPump = (v) =>
+    update((st) => ({ ...st, pumpMl: v }));
+  const [pumpRaw, setPumpRaw] = useState(pumpMl ? String(pumpMl) : "");
 
   if (!t) {
     return (
@@ -1514,9 +1608,51 @@ function FeedModelCard({ state, events, update }) {
           : "Медиана по ПОЛНЫМ дням: тем, где есть кормление и до 9 утра, и после 19 вечера. Считать по числу записей нельзя — тогда «мало кормлений» и «мало отмечено» неразличимы, и неполные дни занижают медиану, а порция от этого завышается. Если знаете фактическое число — поправьте кнопками, расчёт пойдёт по нему."}
       </p>
       <div className="field">
+        <span className="field-l">Утреннее сцеживание, 1 грудь</span>
+        <div className="field-c">
+          <input
+            className="inp pump-in" inputMode="decimal" placeholder="мл"
+            value={pumpRaw}
+            onChange={(e) => setPumpRaw(e.target.value.replace(",", "."))}
+            onBlur={() => {
+              const v = Number(pumpRaw);
+              setPump(Number.isFinite(v) && v > 0 ? Math.round(v) : null);
+              if (!(Number.isFinite(v) && v > 0)) setPumpRaw("");
+            }}
+          />
+          {pumpMl && (
+            <button className="linkish" onClick={() => { setPump(null); setPumpRaw(""); }}>Убрать</button>
+          )}
+        </div>
+      </div>
+      <p className="hint" style={{ marginTop: 0 }}>
+        {pumpMl
+          ? "Пока поле заполнено, объём кормления считается ПРЯМО от этой цифры, а не от суточного бюджета — по вашей просьбе."
+          : "Необязательно. Если сцеживаете одну грудь по утрам, это более прямой сигнал, чем деление суточного бюджета на число кормлений, — можно опереться на него."}
+      </p>
+      {pumpMl && (
+        <p className="hint">
+          Две оговорки, которые стоит держать в уме. Во-первых, помпа
+          обычно извлекает меньше, чем эффективно сосущий ребёнок: в
+          исследовании с контрольным взвешиванием дети высасывали
+          в среднем около 67 % молока, доступного в груди к началу
+          кормления (разброс большой, 0–100 %). Пока сцеживание меньше
+          того, что реально съедает ребёнок, это осторожная, а не
+          завышенная оценка. Во-вторых, утренняя выработка обычно
+          самая высокая за сутки — если кормление идёт из одной груди
+          за раз, дневные порции обычно будет ниже, чем эта цифра.
+        </p>
+      )}
+      <div className="field">
         <span className="field-l">Отсюда объём кормления</span>
         <span className="field-v bt-num">≈{Math.round(t.ml)} мл</span>
       </div>
+      {t.pumpBased && (
+        <p className="hint">
+          Для сравнения: без сцеживания, по суточному бюджету и числу
+          кормлений, получилось бы ≈{Math.round(t.computedMl)} мл.
+        </p>
+      )}
       {p && !p.empty && p.interval != null && (
         <div className="field">
           <span className="field-l">Свой промежуток между кормлениями</span>
@@ -1592,8 +1728,8 @@ function FeedModelCard({ state, events, update }) {
  * освободился ли желудок. Кормление по требованию этим подменять
  * нельзя, и сигналы ребёнка точнее любого расчёта.
  */
-function FeedNote({ events, profile, now, feedsPerDay }) {
-  const p = predictFeed(events, profile.birth, profile.sex || null, now, feedsPerDay);
+function FeedNote({ events, profile, now, feedsPerDay, pumpMl }) {
+  const p = predictFeed(events, profile.birth, profile.sex || null, now, feedsPerDay, pumpMl);
   if (!p) return null;
 
   if (p.empty) {
@@ -2020,7 +2156,7 @@ function SettlePicker({ value, onPick, hint }) {
   return (
     <div className="settle">
       <div className="settle-l">Что-то пошло не так?</div>
-      <div className="settle-row">
+      <div className="settle-row settle-row-3">
         {SETTLE_KINDS.map((k) => (
           <button
             key={k}
@@ -2038,7 +2174,7 @@ function SettlePicker({ value, onPick, hint }) {
   );
 }
 
-function EditSheet({ ev, nights, onShift, onMl, onValue, onDays, onNight, onSettle, onClose, onDelete }) {
+function EditSheet({ ev, nights, onShift, onMl, onSeconds, onValue, onDays, onNight, onSettle, onClose, onDelete }) {
   const ind = IND[ev.type];
   if (ind) {
     const [small, big] = ind.steps;
@@ -2112,7 +2248,7 @@ function EditSheet({ ev, nights, onShift, onMl, onValue, onDays, onNight, onSett
         {ev.type === "sleep" && !isNight(ev, nights) && (
           <SettlePicker value={settleOf(ev)} onPick={onSettle} />
         )}
-        {ev.type === "feed" && ev.meta?.kind === "formula" && (
+        {ev.type === "feed" && (ev.meta?.kind === "formula" || ev.meta?.kind === "ebm") && (
           <div className="field">
             <span className="field-l">Объём, мл</span>
             <div className="field-c">
@@ -2121,6 +2257,24 @@ function EditSheet({ ev, nights, onShift, onMl, onValue, onDays, onNight, onSett
               <button className="nudge" onClick={() => onMl(10)}>+10</button>
             </div>
           </div>
+        )}
+        {ev.type === "feed" && ev.meta?.kind === "breast" && (
+          <>
+            <div className="field">
+              <span className="field-l">Длительность</span>
+              <div className="field-c">
+                <button className="nudge" onClick={() => onSeconds(-60)}>−1 мин</button>
+                <span className="field-v bt-num">
+                  {Math.round((ev.meta?.sec || 0) / 60)} мин
+                </span>
+                <button className="nudge" onClick={() => onSeconds(60)}>+1 мин</button>
+              </div>
+            </div>
+            <p className="hint">
+              Объём кормления пересчитается по новой длительности — независимо
+              от того, когда именно оно началось и закончилось.
+            </p>
+          </>
         )}
         <div className="sheet-act">
           <button className="sact ghost" onClick={onClose}>Готово</button>
