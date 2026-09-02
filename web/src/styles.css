@@ -191,3 +191,9 @@ button:focus-visible, input:focus-visible { outline: 2px solid #8a97e6; outline-
 
 /* поле сцеживания */
 .pump-in { width: 70px; text-align: right; }
+
+/* шестерёнка настроек в шапке */
+.bt-head { position: relative; }
+.gear-b { position: absolute; right: 0; top: 50%; transform: translateY(-50%); background: none; border: none; color: #8a8299; padding: 6px; cursor: pointer; }
+.gear-b:hover { color: #ede6ff; }
+.settings-sheet { max-height: 82vh; overflow-y: auto; }

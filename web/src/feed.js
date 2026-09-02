@@ -59,7 +59,7 @@
  */
 
 import { MIN, DAY, startOfDay, illnessPeriods, isSickAt } from "./sleep.js";
-import { medianKg } from "./growth.js";
+import { IND, medianKg, zOf, valueAt, inRange } from "./growth.js";
 
 /** Период полувыведения из желудка, минуты. */
 export const HALF_LIFE = { breast: 47, formula: 65 };
@@ -107,14 +107,65 @@ export function mlPerKg(ageDays) {
  * объём кормления процентов на десять, что тонет в разбросе
  * опорожнения. Но в интерфейсе это оговаривается.
  */
+/**
+ * Дальше какого срока после взвешивания экстраполяция по перцентилю
+ * не продолжается, а вес просто держится последним измеренным. Не
+ * потому что канал перестаёт быть верным допущением, а потому что
+ * два месяца без единого взвешивания — сами по себе повод предложить
+ * взвесить ребёнка, а не тянуть кривую всё дальше без проверки.
+ */
+export const WEIGHT_EXTRAPOLATE_MAX_DAYS = 60;
+
+/**
+ * Вес ребёнка сейчас — не последнее измеренное число, а его
+ * ПРОЕКЦИЯ вперёд, вдоль того же перцентильного канала ВОЗ.
+ *
+ * Был баг, обнаруженный на суточном объёме кормления: между
+ * взвешиваниями вес держался буквально замороженным на последнем
+ * числе, а таблица мл/кг/сут (мета-анализ по возрасту) МОНОТОННО
+ * убывает с возрастом на всём диапазоне. Возраст растёт, вес стоит —
+ * суточный объём обязан был медленно падать каждый день, даже когда
+ * ребёнок нормально растёт. На реальных данных: 711 мл в день
+ * взвешивания -> 699 мл десятью днями позже без единого нового
+ * измерения, притом что по медиане ВОЗ на том же отрезке возраста
+ * объём должен РАСТИ (692 -> 772 мл к четырём месяцам).
+ *
+ * Экстраполяция вдоль перцентиля — стандартное клиническое допущение:
+ * здоровый ребёнок в норме держится примерно одной и той же
+ * z-оценки, а не одного и того же веса в кг. Считаем z в момент
+ * измерения и проецируем эту же z-оценку на сегодняшний возраст.
+ *
+ * Если пол не задан или взвешивание за пределами таблицы ВОЗ (совсем
+ * недоношенный на старте, к примеру) — используется старое поведение,
+ * последнее измеренное значение без изменений: экстраполировать
+ * канал, которого не знаем, было бы хуже, чем не экстраполировать
+ * вовсе.
+ */
 export function weightKg(events, birth, sex, now = Date.now()) {
   const w = events
     .filter((e) => e.type === "weight" && !e.deleted && Number.isFinite(e.meta?.g))
     .sort((a, b) => b.start - a.start)[0];
-  if (w) return { kg: w.meta.g / 1000, measured: true };
+
+  if (w) {
+    const kgMeasured = w.meta.g / 1000;
+    const ageAtMeasure = (w.start - birth) / DAY;
+    const ageNow = (now - birth) / DAY;
+    const gapDays = ageNow - ageAtMeasure;
+
+    if (sex && gapDays > 0 && gapDays <= WEIGHT_EXTRAPOLATE_MAX_DAYS
+        && inRange(IND.weight, ageAtMeasure) && inRange(IND.weight, ageNow)) {
+      const z = zOf(IND.weight, sex, ageAtMeasure, kgMeasured);
+      const projected = z != null ? valueAt(IND.weight, sex, ageNow, z) : null;
+      if (projected != null) {
+        return { kg: projected, measured: true, extrapolated: true, measuredKg: kgMeasured, z };
+      }
+    }
+    return { kg: kgMeasured, measured: true, extrapolated: false };
+  }
+
   const days = (now - birth) / DAY;
   const m = sex ? medianKg(sex, days) : null;
-  return m == null ? null : { kg: m, measured: false };
+  return m == null ? null : { kg: m, measured: false, extrapolated: false };
 }
 
 /** Суточный бюджет, мл. */

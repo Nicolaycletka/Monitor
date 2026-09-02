@@ -116,6 +116,7 @@ const noonOf = (isoStr) => {
 
 export default function App() {
   const [state, setState] = useState(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [section, setSection] = useState("sleep");
   const [tab, setTab] = useState("now");
   const [tick, setTick] = useState(Date.now());
@@ -414,7 +415,7 @@ export default function App() {
   // predictNext сам измеряет личную поправку по хвосту истории
   // (~3 мс на 90 днях) и применяет её — отдельно её считать не нужно
   const win = active ? null : predictNext(events, profile.birth, tick, bias || 0);
-  const napRef = active ? typicalNap(events, active.start, 10, profile.birth) : null;
+  const napRef = active ? typicalNap(events, active.start, 10, profile.birth, active) : null;
   const todayStart = startOfDay(tick);
   const pending = (state.events || []).filter((e) => e.dirty).length;
 
@@ -424,7 +425,14 @@ export default function App() {
         <header className="bt-head">
           <span className="bt-name">{profile.name}</span>
           <span className="bt-age">{ageText(profile.birth, tick)}</span>
+          <button className="gear-b" aria-label="Настройки" onClick={() => setSettingsOpen(true)}>
+            <GearIcon />
+          </button>
         </header>
+
+        {settingsOpen && (
+          <SettingsSheet state={state} update={update} onClose={() => setSettingsOpen(false)} />
+        )}
 
         <div className="seg">
           {Object.entries(SECTIONS).map(([k, sec]) => (
@@ -991,9 +999,6 @@ function IllnessCard({ periods, onSave, onRemove }) {
 }
 
 function WeekView({ state, events, nights, update, onSaveIllness, onRemoveIllness }) {
-  const [copied, setCopied] = useState(false);
-  const [tgLink, setTgLink] = useState(null);
-  const [tgErr, setTgErr] = useState(false);
   const today = startOfDay(Date.now());
   const days = Array.from({ length: 7 }, (_, i) => today - (6 - i) * DAY);
   const stats = days.map((d) => dayStats(events, d, nights));
@@ -1038,15 +1043,6 @@ function WeekView({ state, events, nights, update, onSaveIllness, onRemoveIllnes
     bias && !bias.usable && bias.raw && Math.abs(bias.raw.median) >= RAW_ALARM;
   const settleNow = settleStats(events, weekEnd - 7 * DAY, weekEnd, state.profile.birth);
   const settleBefore = settleStats(events, weekEnd - 14 * DAY, weekEnd - 7 * DAY, state.profile.birth);
-  const link = inviteLink(state.auth.token);
-
-  useEffect(() => {
-    fetchTelegramLink(state.auth.token).then(
-      (url) => (url ? setTgLink(url) : setTgErr(true)),
-      () => setTgErr(true)
-    );
-  }, [state.auth.token]);
-
   return (
     <>
       <div className="sec" style={{ marginTop: 0 }}>Последние 7 дней</div>
@@ -1055,7 +1051,9 @@ function WeekView({ state, events, nights, update, onSaveIllness, onRemoveIllnes
           <span className="week-lab">
             {new Date(d).toLocaleDateString("ru-RU", { weekday: "short", day: "numeric" })}
           </span>
-          <div className="week-rib"><Ribbon events={events} dayStart={d} height={16} /></div>
+          <div className="week-rib">
+            <Ribbon events={events} dayStart={d} height={16} showNow={d === today} />
+          </div>
           <span className="week-tot bt-num">{stats[i].total ? durShort(stats[i].total) : "—"}</span>
           <span className="week-food bt-num">
             {foodStats[i]
@@ -1298,54 +1296,14 @@ function WeekView({ state, events, nights, update, onSaveIllness, onRemoveIllnes
         )}
       </div>
 
-      <div className="sec">Второй родитель</div>
-      <div className="bt-card">
-        <p className="hint" style={{ marginTop: 0 }}>
-          Откройте эту ссылку на втором телефоне — записи будут общими. Ссылка
-          даёт полный доступ к дневнику, поэтому отправляйте её только тому, кому доверяете.
-        </p>
-        <input className="inp" readOnly value={link} onFocus={(e) => e.target.select()} />
-        <button className="sact ghost full" onClick={async () => {
-          try {
-            if (navigator.share) await navigator.share({ url: link, title: "Дневник сна" });
-            else await navigator.clipboard.writeText(link);
-            setCopied(true);
-            setTimeout(() => setCopied(false), 2500);
-          } catch { /* пользователь отменил */ }
-        }}>
-          {copied ? "Скопировано" : "Поделиться ссылкой"}
-        </button>
-      </div>
-
       <div className="sec">Точность прогноза</div>
       <QualityCard state={state} events={events} />
 
       <div className="sec">Кормления</div>
-      <FeedModelCard state={state} events={events} update={update} />
+      <FeedModelCard state={state} events={events} />
 
       <div className="sec">Вехи развития</div>
-      <MilestonesCard state={state} update={update} />
-
-      <div className="sec">Уведомления в Telegram</div>
-      <div className="bt-card">
-        <p className="hint" style={{ marginTop: 0 }}>
-          Бот пришлёт сообщение по тому же расчёту, что показан на вкладке
-          «Сейчас». Откройте ссылку в Telegram на телефоне каждого родителя,
-          кто хочет получать напоминания.
-        </p>
-
-        <NotifyPrefs state={state} update={update} />
-
-        {tgLink ? (
-          <a className="sact ghost full" href={tgLink} target="_blank" rel="noreferrer">
-            Открыть бота
-          </a>
-        ) : tgErr ? (
-          <p className="hint">Бот сейчас недоступен — попробуйте позже.</p>
-        ) : (
-          <p className="hint">Загружаю ссылку…</p>
-        )}
-      </div>
+      <MilestonesCard state={state} />
 
       <div className="sec">Откуда цифры</div>
       <div className="bt-card">
@@ -1362,20 +1320,6 @@ function WeekView({ state, events, nights, update, onSaveIllness, onRemoveIllnes
         </p>
       </div>
 
-      <div className="sec">Данные</div>
-      <div className="bt-card">
-        <button className="sact ghost full" onClick={() => {
-          const blob = new Blob([JSON.stringify({ profile: state.profile, events }, null, 1)],
-            { type: "application/json" });
-          const a = document.createElement("a");
-          a.href = URL.createObjectURL(blob);
-          a.download = `sleep-${new Date().toISOString().slice(0, 10)}.json`;
-          a.click();
-          URL.revokeObjectURL(a.href);
-        }}>
-          Скачать резервную копию
-        </button>
-      </div>
     </>
   );
 }
@@ -1401,34 +1345,16 @@ function WeekView({ state, events, nights, update, onSaveIllness, onRemoveIllnes
  * не в срок это меняет момент скачка на недели. Ежемесячные вехи
  * навыков всегда считаются от даты рождения, ПДР на них не влияет.
  */
-function MilestonesCard({ state, update }) {
+function MilestonesCard({ state }) {
   const { birth, dueAt } = state.profile;
-  const [raw, setRaw] = useState(dueAt ? toInput(dueAt) : "");
   const ov = milestoneOverview(birth, dueAt ?? null, Date.now());
-
-  const setDue = (iso) =>
-    update((st) => ({
-      ...st,
-      profile: { ...st.profile, dueAt: iso ? noonOf(iso) : null, updatedAt: Date.now() },
-      profileDirty: true,
-    }));
 
   return (
     <div className="bt-card">
-      <div className="field">
-        <span className="field-l">ПДР (если знаете)</span>
-        <div className="field-c">
-          <input className="inp" type="date" value={raw}
-            onChange={(e) => { setRaw(e.target.value); setDue(e.target.value || null); }} />
-          {dueAt && (
-            <button className="linkish" onClick={() => { setRaw(""); setDue(null); }}>Убрать</button>
-          )}
-        </div>
-      </div>
       <p className="hint" style={{ marginTop: 0 }}>
         {dueAt
-          ? "Скачки развития считаются от ПДР — точнее для родившихся не в срок. Ежемесячные вехи навыков всё равно считаются от даты рождения."
-          : "Необязательно. Без ПДР скачки развития считаются от даты рождения — для родившегося в срок разницы почти нет, для недоношенного или переношенного она может достигать нескольких недель."}
+          ? "Скачки развития считаются от указанной вами ПДР — точнее для родившихся не в срок."
+          : "ПДР не указана — скачки развития считаются от даты рождения. Указать её можно в настройках ⚙️."}
       </p>
       {ov && (
         <>
@@ -1450,6 +1376,182 @@ function MilestonesCard({ state, update }) {
         предсказание вашего ребёнка конкретно — общие ориентиры для
         интереса и повод спросить педиатра, если что-то настораживает.
       </p>
+    </div>
+  );
+}
+
+/** Простая иконка шестерёнки — без внешних зависимостей и SVG-спрайтов. */
+function GearIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <circle cx="12" cy="12" r="3.2" />
+      <path d="M19.4 13a7.5 7.5 0 0 0 0-2l2-1.4-2-3.4-2.3.8a7.7 7.7 0 0 0-1.7-1L15 3H9l-.4 2.4a7.7 7.7 0 0 0-1.7 1l-2.3-.8-2 3.4L4.6 11a7.5 7.5 0 0 0 0 2l-2 1.4 2 3.4 2.3-.8a7.7 7.7 0 0 0 1.7 1L9 21h6l.4-2.4a7.7 7.7 0 0 0 1.7-1l2.3.8 2-3.4-2-1.4Z" />
+    </svg>
+  );
+}
+
+/**
+ * Настройки — раньше жили вперемешку с недельной статистикой и
+ * заметками «откуда цифры», теперь собраны в одном месте: приглашение
+ * второго родителя, уведомления в Telegram и их виды, ПДР, сцеживание,
+ * число кормлений вручную, резервная копия. Всё, что МЕНЯЕТ поведение
+ * приложения, а не просто ПОКАЗЫВАЕТ его — здесь; расчёты и объяснения
+ * остаются в «Неделе», рядом с тем, на что они влияют.
+ */
+function SettingsSheet({ state, update, onClose }) {
+  const [copied, setCopied] = useState(false);
+  const [tgLink, setTgLink] = useState(null);
+  const [tgErr, setTgErr] = useState(false);
+  const link = inviteLink(state.auth.token);
+
+  useEffect(() => {
+    fetchTelegramLink(state.auth.token).then(
+      (url) => (url ? setTgLink(url) : setTgErr(true)),
+      () => setTgErr(true)
+    );
+  }, [state.auth.token]);
+
+  const { dueAt } = state.profile;
+  const [dueRaw, setDueRaw] = useState(dueAt ? toInput(dueAt) : "");
+  const setDue = (iso) =>
+    update((st) => ({
+      ...st,
+      profile: { ...st.profile, dueAt: iso ? noonOf(iso) : null, updatedAt: Date.now() },
+      profileDirty: true,
+    }));
+
+  const manual = state.feedsPerDay ?? null;
+  const pumpMl = state.pumpMl ?? null;
+  const [pumpRaw, setPumpRaw] = useState(pumpMl ? String(pumpMl) : "");
+  const setFeeds = (v) => update((st) => ({ ...st, feedsPerDay: v }));
+  const setPump = (v) => update((st) => ({ ...st, pumpMl: v }));
+
+  return (
+    <div className="sheet-bg" onClick={onClose}>
+      <div className="sheet settings-sheet" onClick={(e) => e.stopPropagation()}>
+        <h3>Настройки</h3>
+
+        <div className="sec" style={{ marginTop: 0 }}>Второй родитель</div>
+        <div className="bt-card">
+          <p className="hint" style={{ marginTop: 0 }}>
+            Откройте эту ссылку на втором телефоне — записи будут общими.
+            Ссылка даёт полный доступ к дневнику, отправляйте только тому,
+            кому доверяете.
+          </p>
+          <input className="inp" readOnly value={link} onFocus={(e) => e.target.select()} />
+          <button className="sact ghost full" onClick={async () => {
+            try {
+              if (navigator.share) await navigator.share({ url: link, title: "Дневник сна" });
+              else await navigator.clipboard.writeText(link);
+              setCopied(true);
+              setTimeout(() => setCopied(false), 2500);
+            } catch { /* пользователь отменил */ }
+          }}>
+            {copied ? "Скопировано" : "Поделиться ссылкой"}
+          </button>
+        </div>
+
+        <div className="sec">Уведомления в Telegram</div>
+        <div className="bt-card">
+          <p className="hint" style={{ marginTop: 0 }}>
+            Бот пришлёт сообщение по тому же расчёту, что показан на вкладке
+            «Сейчас». Откройте ссылку в Telegram на телефоне каждого родителя,
+            кто хочет получать напоминания.
+          </p>
+          <NotifyPrefs state={state} update={update} />
+          {tgLink ? (
+            <a className="sact ghost full" href={tgLink} target="_blank" rel="noreferrer">
+              Открыть бота
+            </a>
+          ) : tgErr ? (
+            <p className="hint">Бот сейчас недоступен — попробуйте позже.</p>
+          ) : (
+            <p className="hint">Загружаю ссылку…</p>
+          )}
+        </div>
+
+        <div className="sec">ПДР</div>
+        <div className="bt-card">
+          <div className="field">
+            <span className="field-l">Если знаете</span>
+            <div className="field-c">
+              <input className="inp" type="date" value={dueRaw}
+                onChange={(e) => { setDueRaw(e.target.value); setDue(e.target.value || null); }} />
+              {dueAt && (
+                <button className="linkish" onClick={() => { setDueRaw(""); setDue(null); }}>Убрать</button>
+              )}
+            </div>
+          </div>
+          <p className="hint" style={{ marginTop: 0 }}>
+            Влияет только на скачки развития — точнее для родившихся не
+            в срок. Ежемесячные вехи навыков всегда считаются от даты
+            рождения.
+          </p>
+        </div>
+
+        <div className="sec">Кормления</div>
+        <div className="bt-card">
+          <div className="field">
+            <span className="field-l">Кормлений в сутки вручную</span>
+            <div className="field-c">
+              <button className="nudge" onClick={() => setFeeds(Math.max((manual ?? 8) - 1, 3))}>−1</button>
+              <span className="field-v bt-num">{manual ?? "авто"}</span>
+              <button className="nudge" onClick={() => setFeeds(Math.min((manual ?? 8) + 1, 20))}>+1</button>
+            </div>
+          </div>
+          {manual != null && (
+            <button className="linkish" onClick={() => setFeeds(null)}>Вернуть автоматическое</button>
+          )}
+          <p className="hint">
+            Если знаете фактическое число кормлений — расчёт объёма пойдёт
+            по нему, а не по медиане за полные дни.
+          </p>
+
+          <div className="field">
+            <span className="field-l">Утреннее сцеживание, 1 грудь, мл</span>
+            <div className="field-c">
+              <input
+                className="inp pump-in" inputMode="decimal" placeholder="мл"
+                value={pumpRaw}
+                onChange={(e) => setPumpRaw(e.target.value.replace(",", "."))}
+                onBlur={() => {
+                  const v = Number(pumpRaw);
+                  setPump(Number.isFinite(v) && v > 0 ? Math.round(v) : null);
+                  if (!(Number.isFinite(v) && v > 0)) setPumpRaw("");
+                }}
+              />
+              {pumpMl && (
+                <button className="linkish" onClick={() => { setPump(null); setPumpRaw(""); }}>Убрать</button>
+              )}
+            </div>
+          </div>
+          <p className="hint">
+            Заполнено — объём кормления считается прямо от этой цифры, а не
+            от суточного бюджета. Помпа обычно извлекает меньше, чем
+            эффективно сосущий ребёнок, а утренняя выработка обычно самая
+            высокая за сутки — подробности и оговорки смотрите в «Неделе».
+          </p>
+        </div>
+
+        <div className="sec">Данные</div>
+        <div className="bt-card">
+          <button className="sact ghost full" onClick={() => {
+            const blob = new Blob([JSON.stringify({ profile: state.profile, events: state.events }, null, 1)],
+              { type: "application/json" });
+            const a = document.createElement("a");
+            a.href = URL.createObjectURL(blob);
+            a.download = `sleep-${new Date().toISOString().slice(0, 10)}.json`;
+            a.click();
+            URL.revokeObjectURL(a.href);
+          }}>
+            Скачать резервную копию
+          </button>
+        </div>
+
+        <div className="sheet-act">
+          <button className="sact ghost" onClick={onClose}>Готово</button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1565,17 +1667,12 @@ function QualityCard({ state, events }) {
 }
 
 /** Что именно приложение считает про кормления и на каких числах. */
-function FeedModelCard({ state, events, update }) {
+function FeedModelCard({ state, events }) {
   const { birth, sex } = state.profile;
   const manual = state.feedsPerDay ?? null;
   const pumpMl = state.pumpMl ?? null;
   const t = perFeedMl(events, birth, sex || null, Date.now(), manual, pumpMl);
   const p = predictFeed(events, birth, sex || null, Date.now(), manual, pumpMl);
-  const setFeeds = (v) =>
-    update((st) => ({ ...st, feedsPerDay: v }));
-  const setPump = (v) =>
-    update((st) => ({ ...st, pumpMl: v }));
-  const [pumpRaw, setPumpRaw] = useState(pumpMl ? String(pumpMl) : "");
 
   if (!t) {
     return (
@@ -1596,51 +1693,18 @@ function FeedModelCard({ state, events, update }) {
       </div>
       <div className="field">
         <span className="field-l">Кормлений в сутки</span>
-        <div className="field-c">
-          <button className="nudge" onClick={() => setFeeds(Math.max((manual ?? t.feeds) - 1, 3))}>−1</button>
-          <span className="field-v bt-num">{t.feeds}</span>
-          <button className="nudge" onClick={() => setFeeds(Math.min((manual ?? t.feeds) + 1, 20))}>+1</button>
-        </div>
+        <span className="field-v bt-num">{t.feeds}</span>
       </div>
       <p className="hint" style={{ marginTop: 0 }}>
         {manual
-          ? <>Значение задано вами. <button className="linkish" onClick={() => setFeeds(null)}>Вернуть автоматическое</button></>
-          : "Медиана по ПОЛНЫМ дням: тем, где есть кормление и до 9 утра, и после 19 вечера. Считать по числу записей нельзя — тогда «мало кормлений» и «мало отмечено» неразличимы, и неполные дни занижают медиану, а порция от этого завышается. Если знаете фактическое число — поправьте кнопками, расчёт пойдёт по нему."}
-      </p>
-      <div className="field">
-        <span className="field-l">Утреннее сцеживание, 1 грудь</span>
-        <div className="field-c">
-          <input
-            className="inp pump-in" inputMode="decimal" placeholder="мл"
-            value={pumpRaw}
-            onChange={(e) => setPumpRaw(e.target.value.replace(",", "."))}
-            onBlur={() => {
-              const v = Number(pumpRaw);
-              setPump(Number.isFinite(v) && v > 0 ? Math.round(v) : null);
-              if (!(Number.isFinite(v) && v > 0)) setPumpRaw("");
-            }}
-          />
-          {pumpMl && (
-            <button className="linkish" onClick={() => { setPump(null); setPumpRaw(""); }}>Убрать</button>
-          )}
-        </div>
-      </div>
-      <p className="hint" style={{ marginTop: 0 }}>
-        {pumpMl
-          ? "Пока поле заполнено, объём кормления считается ПРЯМО от этой цифры, а не от суточного бюджета — по вашей просьбе."
-          : "Необязательно. Если сцеживаете одну грудь по утрам, это более прямой сигнал, чем деление суточного бюджета на число кормлений, — можно опереться на него."}
+          ? "Значение задано вручную, в настройках ⚙️."
+          : "Медиана по ПОЛНЫМ дням: тем, где есть кормление и до 9 утра, и после 19 вечера. Считать по числу записей нельзя — тогда «мало кормлений» и «мало отмечено» неразличимы, и неполные дни занижают медиану, а порция от этого завышается. Если знаете фактическое число — поправьте в настройках ⚙️, расчёт пойдёт по нему."}
       </p>
       {pumpMl && (
-        <p className="hint">
-          Две оговорки, которые стоит держать в уме. Во-первых, помпа
-          обычно извлекает меньше, чем эффективно сосущий ребёнок: в
-          исследовании с контрольным взвешиванием дети высасывали
-          в среднем около 67 % молока, доступного в груди к началу
-          кормления (разброс большой, 0–100 %). Пока сцеживание меньше
-          того, что реально съедает ребёнок, это осторожная, а не
-          завышенная оценка. Во-вторых, утренняя выработка обычно
-          самая высокая за сутки — если кормление идёт из одной груди
-          за раз, дневные порции обычно будет ниже, чем эта цифра.
+        <p className="hint" style={{ marginTop: 0 }}>
+          Указано сцеживание одной груди утром — {pumpMl} мл. Объём кормления
+          считается прямо от этой цифры, а не от суточного бюджета. Изменить
+          или убрать — в настройках ⚙️.
         </p>
       )}
       <div className="field">

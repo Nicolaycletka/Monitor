@@ -392,9 +392,47 @@ export const autoNight = (ev, nights) =>
  * становятся односцикловыми, и абсолютный порог в 40 минут
  * срабатывал бы на каждом.
  */
-export function typicalNap(events, before = Date.now(), n = 10, birth = null) {
-  const lens = mergeSleeps(healthySleeps(events), birth)
-    .filter((e) => e.end && !isNightSleep(e) && e.end <= before)
+/**
+ * Порог прогресса дня, отделяющий сон-перед-ночью от обычных дневных
+ * снов. Подобран эмпирически по реальной истории: во всех наблюдённых
+ * случаях сон, оказавшийся последним перед ночью, начинался при
+ * прогрессе 0,68–0,83, а любой другой дневной сон — не выше 0,63.
+ * Порог 0,65 лежит ровно между кластерами и не требует знать заранее,
+ * окажется ли сон последним: прогресс считается по его СОБСТВЕННОМУ
+ * времени начала, доступному в момент прогноза, без заглядывания вперёд.
+ */
+export const LATE_NAP_THRESHOLD = 0.65;
+
+/**
+ * Типичная длина дневного сна — медиана последних `n` снов.
+ *
+ * `matchNap`, если передан, ограничивает пул снами ТОЙ ЖЕ половины
+ * дня, что и он сам (до порога `LATE_NAP_THRESHOLD` или после).
+ * Без этого сон перед ночью — обычно короткая дрёма перед
+ * укладыванием — сравнивался бы с пулом, где доминируют долгие
+ * утренние и дневные сны: на реальных данных медиана по всем сонам
+ * была 94–103 минуты, а сам сон перед ночью — 5–70 минут, то есть
+ * 5–39% от пулового ориентира почти всегда. Штраф за «короткий сон»
+ * (см. предictWindow) в такой ситуации применялся у самой границы
+ * почти на каждом укладывании перед ночью — не потому что сон и
+ * правда был недостаточным, а потому что сравнение шло не с тем.
+ *
+ * Если в своей половине дня наблюдений меньше MIN_SAMPLES — используется
+ * общий пул (то же поведение, что было раньше): рано разделять то,
+ * на что ещё не набралась история.
+ */
+export function typicalNap(events, before = Date.now(), n = 10, birth = null, matchNap = null) {
+  const merged = mergeSleeps(healthySleeps(events), birth);
+  const candidates = merged.filter((e) => e.end && !isNightSleep(e) && e.end <= before);
+
+  let pool = candidates;
+  if (matchNap) {
+    const wantLate = progressAt(merged, matchNap) >= LATE_NAP_THRESHOLD;
+    const matched = candidates.filter((e) => (progressAt(merged, e) >= LATE_NAP_THRESHOLD) === wantLate);
+    if (matched.length >= MIN_SAMPLES) pool = matched;
+  }
+
+  const lens = pool
     .sort((a, b) => b.end - a.end)
     .slice(0, n)
     .map((e) => (e.end - e.start) / MIN)
@@ -542,7 +580,7 @@ export function personalWindow(events, birth, now = Date.now()) {
     let shortPenalty = 0;
     if (!isNightSleep(prev)) {
       const len = (prev.end - prev.start) / MIN;
-      const ref = typicalNap(hist, prev.start, 10, birth);
+      const ref = typicalNap(hist, prev.start, 10, birth, prev);
       if (ref != null) shortPenalty = 15 * clamp01((ref - len) / (ref * 0.3));
     }
     const reduction = Math.max(carryOver(hist), shortPenalty);
@@ -657,7 +695,7 @@ export function predictWindow(events, birth, now, bias = 0, opts = {}) {
   let shortPenalty = 0;
   if (!isNightSleep(last)) {
     const len = (last.end - last.start) / MIN;
-    const ref = typicalNap(sleeps, last.start, 10, birth);
+    const ref = typicalNap(sleeps, last.start, 10, birth, last);
     if (ref != null) shortPenalty = 15 * clamp01((ref - len) / (ref * 0.3));
   }
 
