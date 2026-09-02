@@ -99,7 +99,7 @@ button { font: inherit; }
 .field-c { display: flex; align-items: center; gap: 8px; }
 .field-v { font-size: 15px; color: #ede6ff; min-width: 54px; text-align: center; }
 .sheet-act { display: flex; gap: 9px; margin-top: 16px; }
-.sact { flex: 1; border-radius: 13px; padding: 13px; font-size: 14px; border: none; cursor: pointer; }
+.sact { display: inline-flex; align-items: center; justify-content: center; text-align: center; text-decoration: none; flex: 1; border-radius: 13px; padding: 13px; font-size: 14px; border: none; cursor: pointer; }
 .sact.full { width: 100%; margin-top: 12px; }
 .sact.ghost { background: #252031; color: #c9c2e0; border: 1px solid #342f45; }
 .sact.del { background: #3a2230; color: #e88b8b; }
@@ -193,7 +193,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid #8a97e6; outline-
 .pump-in { width: 70px; text-align: right; }
 
 /* шестерёнка настроек в шапке */
-.bt-head { position: relative; }
+.bt-head { position: relative; padding-right: 40px; }  /* место под шестерёнку — она вне потока (position:absolute) и не участвует в flex-раскладке */
 .gear-b { position: absolute; right: 0; top: 50%; transform: translateY(-50%); background: none; border: none; color: #8a8299; padding: 6px; cursor: pointer; }
 .gear-b:hover { color: #ede6ff; }
 .settings-sheet { max-height: 82vh; overflow-y: auto; }
