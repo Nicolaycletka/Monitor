@@ -46,9 +46,30 @@ const click = async (text) => {
 
 console.log("экран                    | размер разметки");
 console.log(`Сон / Сейчас             | ${String(document.getElementById("root").innerHTML.length).padStart(6)} символов`);
-for (const [sec, tabs] of [["Сон",["День","Неделя"]],["Здоровье",["Вес","Рост","Голова"]]]) {
+for (const [sec, tabs] of [["Трекер",["Неделя"]],["Здоровье",["Вес","Рост","Голова"]]]) {
   console.log(`${sec.padEnd(24)} | ${await click(sec)}`);
   for (const t of tabs) console.log(`${(sec+" / "+t).padEnd(24)} | ${await click(t)}`);
 }
+/*
+ * Настройки открываются отдельно: они не вкладка, и обход по нижним
+ * кнопкам их не задевает. Через эту дыру уже проскочил ReferenceError
+ * на несуществующей константе — сборка его не ловит, обход вкладок
+ * тоже, а живой клик ловит сразу.
+ */
+const gear = document.querySelector(".gear-b");
+if (!gear) {
+  console.log("Настройки                | ШЕСТЕРЁНКА НЕ НАЙДЕНА");
+} else {
+  gear.click();
+  await wait(400);
+  const blocks = [...document.querySelectorAll(".info-h")];
+  console.log(`Настройки                | ${String(document.getElementById("root").innerHTML.length).padStart(6)} символов, разделов «Как считается»: ${blocks.length}`);
+  for (const b of blocks) {
+    b.click();
+    await wait(150);
+  }
+  console.log(`Разделы раскрыты         | ${String(document.getElementById("root").innerHTML.length).padStart(6)} символов`);
+}
+
 console.log(errs.length ? "\nОШИБКИ:\n" + errs.slice(0,3).join("\n") : "\nошибок нет");
 process.exit(errs.length ? 1 : 0);

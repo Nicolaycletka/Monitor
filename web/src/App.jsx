@@ -4,7 +4,7 @@ import {
   sleepNorm, isNightSleep, isNight, autoNight, nightFragments, sourceScores, pickSource, sourceLabel, TABLES, PICK_MARGIN, predictNext, daySegments, dayStats, measureBias,
   medianNapIn, typicalNap, autoBias, settleOf, settleStats,
   settleShare, settleNudge, SETTLE_KINDS, SETTLE_LABEL, SETTLE_HINT, RAW_ALARM,
-  selfCheck, biasProfile,
+  selfCheck, biasProfile, WINDOW_HALF,
 } from "./sleep.js";
 import {
   loadState, saveState, createHousehold, syncOnce, uid, liveEvents,
@@ -52,8 +52,8 @@ const MEASURE_NOTE = {
  */
 const SECTIONS = {
   sleep: {
-    label: "Сон",
-    tabs: [["now", "Сейчас"], ["day", "День"], ["week", "Неделя"]],
+    label: "Трекер",
+    tabs: [["now", "Сейчас"], ["week", "Неделя"]],
   },
   health: {
     label: "Здоровье",
@@ -417,10 +417,20 @@ export default function App() {
   const win = active ? null : predictNext(events, profile.birth, tick, bias || 0);
   const napRef = active ? typicalNap(events, active.start, 10, profile.birth, active) : null;
   const todayStart = startOfDay(tick);
+  // общие и для живого состояния, и для списка записей — раньше это
+  // было продублировано между вкладками "Сейчас" и "День"
+  const dayStart = todayStart - offset * DAY;
+  const dayList = events
+    .filter((e) => {
+      if (e.type === "illness") return false;
+      const end = e.type === "sleep" ? e.end ?? Date.now() : e.start;
+      return end >= dayStart && e.start < dayStart + DAY;
+    })
+    .sort((a, b) => b.start - a.start);
   const pending = (state.events || []).filter((e) => e.dirty).length;
 
   return (
-    <div className="bt">
+    <div className={"bt sec-" + section}>
       <div className="bt-shell">
         <header className="bt-head">
           <span className="bt-name">{profile.name}</span>
@@ -431,7 +441,7 @@ export default function App() {
         </header>
 
         {settingsOpen && (
-          <SettingsSheet state={state} update={update} onClose={() => setSettingsOpen(false)} />
+          <SettingsSheet state={state} events={events} update={update} onClose={() => setSettingsOpen(false)} />
         )}
 
         <div className="seg">
@@ -454,23 +464,28 @@ export default function App() {
 
         {tab === "now" && (
           <>
-            {openIllness && (
+            {offset === 0 && openIllness && (
               <div className="bt-card sick">
                 <div className="sick-t">Болезнь · с {dayLabel(startOfDay(openIllness.start))}</div>
                 <p className="hint" style={{ marginTop: 6 }}>
-                  Записи за это время не идут в обучение: приложение не запомнит
-                  сбитый болезнью ритм как норму. Прогноз пока строится по тому,
-                  что было до, и сейчас он менее точен. Дату выздоровления
-                  проставьте на вкладке «Неделя».
+                  Записи за это время не идут в обучение. Дату выздоровления —
+                  на вкладке «Неделя».
                 </p>
               </div>
             )}
 
+            <div className="bt-head" style={{ marginBottom: 10 }}>
+              <button className="nudge wide" onClick={() => setOffset(offset + 1)}>←</button>
+              <span className="bt-name">{offset === 0 ? "Сегодня" : dayLabel(dayStart)}</span>
+              <button className="nudge wide" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - 1))}>→</button>
+            </div>
+
             <div className="rib-wrap">
-              <Ribbon events={events} dayStart={todayStart} showNow />
+              <Ribbon events={events} dayStart={dayStart} showNow={offset === 0} />
               <Axis />
             </div>
 
+            {offset === 0 && (
             <section className="bt-card">
               <div className="state">
                 <div className="state-label">
@@ -510,7 +525,10 @@ export default function App() {
                 {active ? "Проснулся" : "Заснул"}
               </button>
             </section>
+            )}
 
+            {offset === 0 && (
+            <>
             <div className="quick">
               <button className={"qbtn" + (nursing ? " on" : "")}
                 onClick={nursing ? stopNursing : startNursing}>
@@ -569,13 +587,35 @@ export default function App() {
 
             <FeedNote events={events} profile={profile} now={tick}
               feedsPerDay={state.feedsPerDay ?? null} pumpMl={state.pumpMl ?? null} />
+            </>
+            )}
 
-            <Kpis stats={dayStats(events, todayStart, nights)} title="Сегодня" />
+            <Kpis stats={dayStats(events, dayStart, nights)} title={offset === 0 ? "Сегодня" : null} />
+
+            <div className="sec">Записи</div>
+            <div className="bt-card list">
+              {dayList.length === 0 ? (
+                <div className="empty">За этот день записей нет.</div>
+              ) : (
+                dayList.map((e) => (
+                  <button className="row" key={e.id} onClick={() => setEditing(e)}>
+                    <span className="dot" style={{ background: eventColor(e) }} />
+                    <span className="row-main">
+                      <span className="row-t">{eventTitle(e, nights)}</span>
+                      <span className="row-s bt-num">
+                        {e.start < dayStart && "вчера "}
+                        {hhmm(e.start)}{e.type === "sleep" && (e.end ? ` – ${hhmm(e.end)}` : " – сейчас")}
+                      </span>
+                    </span>
+                    {e.type === "sleep" && (
+                      <span className="row-r bt-num">{dur((e.end ?? Date.now()) - e.start)}</span>
+                    )}
+                  </button>
+                ))
+              )}
+            </div>
+            <p className="hint">Нажмите на запись, чтобы поправить время или удалить.</p>
           </>
-        )}
-
-        {tab === "day" && (
-          <DayView events={events} nights={nights} offset={offset} setOffset={setOffset} onPick={setEditing} />
         )}
 
         {IND[tab] && (
@@ -664,8 +704,12 @@ const Splash = ({ text }) => (
   <div className="bt"><div className="bt-shell"><div className="empty">{text}</div></div></div>
 );
 
+/** Часовые деления через 3 часа — на весь день читаемо и на телефоне. */
+const AXIS_HOURS = [0, 3, 6, 9, 12, 15, 18, 21, 24];
 const Axis = () => (
-  <div className="rib-axis"><span>00</span><span>06</span><span>12</span><span>18</span><span>24</span></div>
+  <div className="rib-axis">
+    {AXIS_HOURS.map((h) => <span key={h}>{String(h).padStart(2, "0")}</span>)}
+  </div>
 );
 
 function Ribbon({ events, dayStart, showNow, height }) {
@@ -786,9 +830,9 @@ function Kpis({ stats, title }) {
       {title && <div className="sec">{title}</div>}
       <div className="kpi">
         <div><div className="kpi-v bt-num">{durShort(stats.total)}</div><div className="kpi-l">всего сна</div></div>
-        <div><div className="kpi-v bt-num">{durShort(stats.day)}</div><div className="kpi-l">дневного</div></div>
+        <div><div className="kpi-v bt-num">{durShort(stats.night)}</div><div className="kpi-l">ночного</div></div>
         <div><div className="kpi-v bt-num">{stats.naps}</div><div className="kpi-l">снов днём</div></div>
-        <div><div className="kpi-v bt-num">{stats.feeds}</div><div className="kpi-l">кормлений</div></div>
+        <div><div className="kpi-v bt-num">{stats.feeds} / {stats.diapers}</div><div className="kpi-l">кормлений / подгузников</div></div>
       </div>
     </>
   );
@@ -830,67 +874,6 @@ function NetLine({ net, pending, onRetry, onRelink }) {
 
 /* ================================================================== */
 
-function DayView({ events, nights, offset, setOffset, onPick }) {
-  const dayStart = startOfDay(Date.now()) - offset * DAY;
-  // отбор по пересечению с сутками, а не по времени начала: иначе
-  // ночной сон, начатый вчера, даёт минуты в статистике, но не виден
-  // в списке — и суммы не сходятся
-  const list = events
-    .filter((e) => {
-      // болезнь — период, а не запись дня: в списке ей не место
-      if (e.type === "illness") return false;
-      const end = e.type === "sleep" ? e.end ?? Date.now() : e.start;
-      return end >= dayStart && e.start < dayStart + DAY;
-    })
-    .sort((a, b) => b.start - a.start);
-  const s = dayStats(events, dayStart, nights);
-
-  return (
-    <>
-      <div className="bt-head" style={{ marginBottom: 10 }}>
-        <button className="nudge wide" onClick={() => setOffset(offset + 1)}>←</button>
-        <span className="bt-name">{dayLabel(dayStart)}</span>
-        <button className="nudge wide" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - 1))}>→</button>
-      </div>
-
-      <div className="rib-wrap">
-        <Ribbon events={events} dayStart={dayStart} showNow={offset === 0} />
-        <Axis />
-      </div>
-
-      <div className="kpi">
-        <div><div className="kpi-v bt-num">{durShort(s.total)}</div><div className="kpi-l">всего сна</div></div>
-        <div><div className="kpi-v bt-num">{durShort(s.night)}</div><div className="kpi-l">ночного</div></div>
-        <div><div className="kpi-v bt-num">{s.naps}</div><div className="kpi-l">снов днём</div></div>
-        <div><div className="kpi-v bt-num">{s.feeds} / {s.diapers}</div><div className="kpi-l">кормлений / подгузников</div></div>
-      </div>
-
-      <div className="sec">Записи</div>
-      <div className="bt-card list">
-        {list.length === 0 ? (
-          <div className="empty">За этот день записей нет.</div>
-        ) : (
-          list.map((e) => (
-            <button className="row" key={e.id} onClick={() => onPick(e)}>
-              <span className="dot" style={{ background: eventColor(e) }} />
-              <span className="row-main">
-                <span className="row-t">{eventTitle(e, nights)}</span>
-                <span className="row-s bt-num">
-                  {e.start < dayStart && "вчера "}
-                  {hhmm(e.start)}{e.type === "sleep" && (e.end ? ` – ${hhmm(e.end)}` : " – сейчас")}
-                </span>
-              </span>
-              {e.type === "sleep" && (
-                <span className="row-r bt-num">{dur((e.end ?? Date.now()) - e.start)}</span>
-              )}
-            </button>
-          ))
-        )}
-      </div>
-      <p className="hint">Нажмите на запись, чтобы поправить время или удалить.</p>
-    </>
-  );
-}
 
 /** Ввод дат — YYYY-MM-DD, локальная полночь. */
 const toInput = (ts) => {
@@ -1062,6 +1045,12 @@ function WeekView({ state, events, nights, update, onSaveIllness, onRemoveIllnes
           </span>
         </div>
       ))}
+      <div className="week-row">
+        <span className="week-lab" />
+        <div className="week-rib"><Axis /></div>
+        <span className="week-tot" />
+        <span className="week-food" />
+      </div>
       <p className="hint" style={{ marginTop: -4 }}>
         {feedModel
           ? "Столбец еды — оценка объёма за сутки: точный для смеси и сцеженного молока, по длительности для кормлений грудью. Так же, как на вкладке «Сейчас»."
@@ -1235,21 +1224,17 @@ function WeekView({ state, events, nights, update, onSaveIllness, onRemoveIllnes
                   <span className="field-l">Сдвиг по меткам укладывания</span>
                   <span className="field-v bt-num">{nudge} мин</span>
                 </div>
-                <p className="hint">
-                  Тяжёлое укладывание означает, что готовность ко сну была раньше
-                  записанного засыпания. Окно сдвигается раньше, пока такие
-                  укладывания не станут редкими — и сдвиг тогда уйдёт сам.
-                </p>
+
               </>
             )}
             <p className="hint">
               {auto === 0
-                ? "Почти не применяется: поправка мала, тонет в разбросе засыпаний или гасится тяжёлыми укладываниями."
+                ? "Почти не применяется: поправка мала или гасится тяжёлыми укладываниями."
                 : auto > 0
-                ? `Поправка «позже» берётся вполовину и тем слабее, чем чаще укладывания идут тяжело${
-                    shares.hardShare ? ` (сейчас ${Math.round(shares.hardShare * 100)}%)` : ""
-                  }: сдвинув окно позже, приложение заставит вас класть позже и потом измерит собственный сдвиг как факт о ребёнке.`
-                : "Поправка «раньше» берётся целиком: ошибиться рано дёшево — ребёнок не уснул, попробовали через четверть часа."}
+                ? `Поправка «позже» берётся не целиком${
+                    shares.hardShare ? `, тяжёлых укладываний сейчас ${Math.round(shares.hardShare * 100)}%` : ""
+                  } — почему, в настройках ⚙️.`
+                : "Поправка «раньше» берётся целиком — ошибиться рано дёшево."}
             </p>
           </>
         ) : (
@@ -1304,21 +1289,6 @@ function WeekView({ state, events, nights, update, onSaveIllness, onRemoveIllnes
 
       <div className="sec">Вехи развития</div>
       <MilestonesCard state={state} />
-
-      <div className="sec">Откуда цифры</div>
-      <div className="bt-card">
-        <p className="hint" style={{ marginTop: 0 }}>
-          Суточная норма сна — консенсус Американской академии медицины сна
-          (AASM, 2016), поддержанный AAP. Для детей младше 4 месяцев норма не
-          установлена: слишком широкий разброс.
-        </p>
-        <p className="hint">
-          Окна бодрствования — сведённые таблицы Huckleberry и Happiest Baby.
-          Это эвристика консультантов по сну, а не клинический норматив.
-          Сигналы ребёнка точнее любого расчёта. Если сон вызывает тревогу —
-          вопрос к педиатру, а не к приложению.
-        </p>
-      </div>
 
     </>
   );
@@ -1380,6 +1350,185 @@ function MilestonesCard({ state }) {
   );
 }
 
+/**
+ * Раздел «Как считается» — всё длинное методологическое объяснение,
+ * которое раньше было размазано по вкладкам между цифрами.
+ *
+ * Смысл разделения: во вкладках остаётся только то, что помогает
+ * ДЕЙСТВОВАТЬ — что делает кнопка, на что смотреть, куда нажать,
+ * чтобы поправить. Объяснение, ПОЧЕМУ число такое, нужно один раз
+ * и по своей инициативе, а не при каждом взгляде на экран. Текст
+ * не сокращён: честность формулировок и оговорки про слабые места
+ * расчёта важнее краткости — просто перенесены туда, где их читают
+ * осознанно.
+ *
+ * Раскрывается по клику, всё свёрнуто по умолчанию: иначе настройки
+ * превратились бы в простыню, из которой не найти переключатель.
+ */
+function InfoSection({ title, children }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="bt-card info-block">
+      <button className="info-h" onClick={() => setOpen(!open)} aria-expanded={open}>
+        <span>{title}</span>
+        <span className="info-x">{open ? "−" : "+"}</span>
+      </button>
+      {open && <div className="info-body">{children}</div>}
+    </div>
+  );
+}
+
+function HowItWorks({ state, events }) {
+  const { birth, sex } = state.profile;
+  const t = perFeedMl(events, birth, sex || null, Date.now(),
+    state.feedsPerDay ?? null, state.pumpMl ?? null);
+
+  return (
+    <>
+      <InfoSection title="Окно сна">
+        <p className="hint" style={{ marginTop: 0 }}>
+          Окно всегда одной ширины — {WINDOW_HALF * 2} минут, в любом возрасте
+          и у любого источника прогноза. Раньше оно расширялось вслед за
+          разбросом засыпаний, и промах от этого становился незаметен, хотя
+          никуда не девался. Попасть в окно — задача алгоритма, а не границ.
+        </p>
+        <p className="hint">
+          Приложение считает прогноз четырьмя способами: собственным
+          алгоритмом (личная прямая по вашим данным плюс поправка) и тремя
+          таблицами возраста. Берётся тот, что промахивался меньше на
+          последних дневных снах. Алгоритм держит фору в {PICK_MARGIN} минуты:
+          он единственный, кто учится на вашем ребёнке, и менять его на
+          статичную таблицу из-за минутного перевеса значило бы выучить шум.
+        </p>
+        <p className="hint">
+          Чужие таблицы взяты как опубликованы, без усреднения и правок.{" "}
+          {TABLES.cara.label}: {TABLES.cara.note}. {TABLES.huck.label}:{" "}
+          {TABLES.huck.note}. Своя — {TABLES.app.note}.
+        </p>
+        <p className="hint">
+          Поправка «позже» берётся не целиком и тем слабее, чем чаще
+          укладывания идут тяжело: сдвинув окно позже, приложение заставит
+          вас класть позже и потом измерит собственный сдвиг как факт
+          о ребёнке. Поправка «раньше» берётся целиком — ошибиться рано
+          дёшево: ребёнок не уснул, попробовали через четверть часа.
+        </p>
+        <p className="hint">
+          Дни болезни в обучение не идут, фрагменты ночного сна склеиваются
+          в один: иначе пробуждение внутри ночи давало бы наблюдение
+          с окном бодрствования в двадцать минут.
+        </p>
+      </InfoSection>
+
+      <InfoSection title="Кормления">
+        <p className="hint" style={{ marginTop: 0 }}>
+          Приложение не предсказывает голод — оно считает, освободился ли
+          желудок. Это разные вещи: голод зависит не только от того, пусто ли
+          в желудке. Поэтому формулировка везде «можно кормить», а не «пора»,
+          и кормление по требованию она не заменяет.
+        </p>
+        <p className="hint">
+          Опорожнение желудка считается экспоненциальным, период
+          полувыведения — {HALF_LIFE.breast} мин для грудного молока
+          и {HALF_LIFE.formula} мин для смеси (дыхательный тест
+          с 13C-октановой кислотой у доношенных). Разброс в исходном
+          исследовании огромный, 16–86 и 27–98 минут, так что расчёт даёт
+          порядок величины, а не минуты.
+        </p>
+        <p className="hint">
+          Кормление грудью записывается таймером, и длительность переводится
+          в объём насыщающей кривой <b>1 − exp(−t/{LETDOWN_TAU})</b>: молоко
+          уходит не равномерно, основная часть передаётся в первые минуты.
+          Постоянная подобрана так, чтобы к 10.5 минутам — средней
+          длительности кормления в исследовании с контрольным взвешиванием
+          доношенных — передавалось около 93 % объёма.
+          {t && t.refMin != null && <> Ваша медианная длительность — {Math.round(t.refMin)} мин,
+          при ней кривая даёт ровно типичный объём.</>}
+        </p>
+        <p className="hint">
+          Из литературы взята только ФОРМА кривой. Величина — своя: в том же
+          исследовании при средних 119.5 г на кормление разброс был 34–222 г,
+          то есть шестикратный, и брать оттуда абсолютные миллилитры
+          бессмысленно.
+        </p>
+        <p className="hint">
+          Объём кормления для груди никто не измеряет — это главная слабость
+          расчёта. Он выводится из суточного объёма по возрасту, делённого
+          на ваше собственное число кормлений. Для смеси и сцеженного молока
+          берётся введённый объём.
+        </p>
+        <p className="hint">
+          Число кормлений в сутки — медиана по ПОЛНЫМ дням: тем, где есть
+          кормление и до 9 утра, и после 19 вечера. Считать по числу записей
+          нельзя: тогда «мало кормлений» и «мало отмечено» неразличимы,
+          и неполные дни занижают медиану, а порция от этого завышается.
+        </p>
+        <p className="hint">
+          Если задано утреннее сцеживание одной груди, объём считается прямо
+          от этой цифры. Две оговорки: помпа обычно извлекает меньше, чем
+          эффективно сосущий ребёнок (в исследовании дети высасывали
+          в среднем около 67 % доступного молока), а утренняя выработка
+          обычно самая высокая за сутки — то есть цифра скорее осторожная,
+          но может быть выше типичной дневной порции.
+        </p>
+        <p className="hint">
+          Пропуск в записях сам по себе ничего не значит. Но если промежуток
+          закрыт отмеченным сном, приложение знает, что ребёнок не ел, —
+          и считает промежуток настоящим. Длинный промежуток без сна и без
+          записей считается дыркой в дневнике, и напоминание не приходит.
+        </p>
+        <p className="hint">
+          Через три часа от прошлого кормления в желудке остаётся около
+          десятой части — расчёт «забывает» пропущенный кусок дня сам собой,
+          и одного отмеченного кормления хватает, чтобы он снова стал
+          осмысленным.
+        </p>
+      </InfoSection>
+
+      <InfoSection title="Рост, вес, окружность головы">
+        <p className="hint" style={{ marginTop: 0 }}>
+          Кривые — WHO Child Growth Standards (2006), таблицы L/M/S:
+          по неделям до 13 недель и по месяцам дальше. Перцентиль считается
+          из z-оценки по этим параметрам, а не берётся из готовой таблицы,
+          поэтому промежуточные возрасты считаются точно, а не округляются
+          до ближайшей недели.
+        </p>
+        <p className="hint">
+          Стандарт построен на доношенных детях. Для родившегося раньше
+          срока возраст положено считать скорректированным — приложение
+          этого не умеет, и перцентиль будет занижен.
+        </p>
+        <p className="hint">
+          Длина обрывается на двух годах: после этого ВОЗ измеряет рост
+          стоя, а это другая величина, примерно на 0.7 см меньше. Вес
+          и голова идут до пяти лет.
+        </p>
+        <p className="hint">
+          Между взвешиваниями вес не держится константой, а проецируется
+          вперёд вдоль того же перцентильного канала: здоровый ребёнок
+          в норме держится примерно одной z-оценки, а не одного веса в кг.
+        </p>
+        <p className="hint">{MEASURE_NOTE.length}</p>
+        <p className="hint">{MEASURE_NOTE.head}</p>
+      </InfoSection>
+
+      <InfoSection title="Вехи развития">
+        <p className="hint" style={{ marginTop: 0 }}>
+          Пуш приходит примерно раз в одну-три недели: ежемесячные заметки
+          о навыках и «красных флагах» (от фактической даты рождения) плюс
+          отдельно — скачки развития по неделям (от ПДР, если она указана).
+        </p>
+        <p className="hint">
+          Это не диагностика и не предсказание вашего ребёнка конкретно —
+          общие ориентиры для интереса и повод спросить педиатра, если
+          что-то настораживает. Разброс нормы в этом возрасте огромный:
+          например, самостоятельная ходьба считается нормативной вплоть
+          до 17–18 месяцев.
+        </p>
+      </InfoSection>
+    </>
+  );
+}
+
 /** Простая иконка шестерёнки — без внешних зависимостей и SVG-спрайтов. */
 function GearIcon() {
   return (
@@ -1398,7 +1547,7 @@ function GearIcon() {
  * приложения, а не просто ПОКАЗЫВАЕТ его — здесь; расчёты и объяснения
  * остаются в «Неделе», рядом с тем, на что они влияют.
  */
-function SettingsSheet({ state, update, onClose }) {
+function SettingsSheet({ state, events, update, onClose }) {
   const [copied, setCopied] = useState(false);
   const [tgLink, setTgLink] = useState(null);
   const [tgErr, setTgErr] = useState(false);
@@ -1533,6 +1682,9 @@ function SettingsSheet({ state, update, onClose }) {
           </p>
         </div>
 
+        <div className="sec">Как считается</div>
+        <HowItWorks state={state} events={events} />
+
         <div className="sec">Данные</div>
         <div className="bt-card">
           <button className="sact ghost full" onClick={() => {
@@ -1639,28 +1791,10 @@ function QualityCard({ state, events }) {
         ))}
       </div>
       <p className="hint">
-        Сейчас работает <b>{sourceLabel(pick.key)}</b>. Приложение считает
-        прогноз всеми четырьмя способами и берёт тот, что промахивался меньше
-        на последних {scores[0].n} дневных снах. Окно у всех одной ширины,
-        поэтому числа сравнимы напрямую.
-      </p>
-      <p className="hint">
-        Алгоритм держит фору в {PICK_MARGIN} минуты: он единственный, кто
-        учится на вашем ребёнке, и менять его на статичную таблицу из-за
-        минутного перевеса на десятке наблюдений значило бы выучить шум.
-        Выбор идёт только по цифрам и без памяти — одни и те же данные всегда
-        дают один и тот же ответ.
-      </p>
-      <p className="hint">
-        Чужие таблицы взяты как опубликованы, без усреднения и правок.{" "}
-        {TABLES.cara.label}: {TABLES.cara.note}. {TABLES.huck.label}:{" "}
-        {TABLES.huck.note}. Своя — {TABLES.app.note}.
-      </p>
-      <p className="hint">
-        Смотреть стоит не на абсолютную долю попаданий — при окне в полчаса
-        и собственном разбросе засыпаний в те же полчаса половина промахов
-        неизбежна, — а на то, растёт ли отрыв выбранного источника
-        от остальных{best === scores[0].miss ? "" : ""}.
+        Сейчас работает <b>{sourceLabel(pick.key)}</b> — тот из четырёх
+        источников, что промахивался меньше на последних {scores[0].n} снах.
+        Смотрите не на абсолютную долю попаданий, а на отрыв выбранного
+        от остальных. Подробности — в настройках ⚙️.
       </p>
     </div>
   );
@@ -1698,7 +1832,7 @@ function FeedModelCard({ state, events }) {
       <p className="hint" style={{ marginTop: 0 }}>
         {manual
           ? "Значение задано вручную, в настройках ⚙️."
-          : "Медиана по ПОЛНЫМ дням: тем, где есть кормление и до 9 утра, и после 19 вечера. Считать по числу записей нельзя — тогда «мало кормлений» и «мало отмечено» неразличимы, и неполные дни занижают медиану, а порция от этого завышается. Если знаете фактическое число — поправьте в настройках ⚙️, расчёт пойдёт по нему."}
+          : "Медиана по полным дням. Знаете фактическое число — задайте в настройках ⚙️."}
       </p>
       {pumpMl && (
         <p className="hint" style={{ marginTop: 0 }}>
@@ -1725,60 +1859,9 @@ function FeedModelCard({ state, events }) {
       )}
 
       <p className="hint">
-        Приложение не предсказывает голод — оно считает, освободился ли
-        желудок. Это разные вещи: голод зависит не только от того, пусто ли
-        в желудке. Поэтому формулировка везде «можно кормить», а не «пора»,
-        и кормление по требованию она не заменяет.
-      </p>
-      <p className="hint">
-        Опорожнение желудка считается экспоненциальным, период
-        полувыведения — {HALF_LIFE.breast} мин для грудного молока
-        и {HALF_LIFE.formula} мин для смеси (дыхательный тест
-        с 13C-октановой кислотой у доношенных). Разброс в исходном
-        исследовании огромный, 16–86 и 27–98 минут, так что расчёт даёт
-        порядок величины, а не минуты.
-      </p>
-      <p className="hint">
-        Кормление грудью записывается таймером, и длительность переводится
-        в объём насыщающей кривой <b>1 − exp(−t/{LETDOWN_TAU})</b>: молоко
-        уходит не равномерно, основная часть передаётся в первые минуты.
-        Постоянная времени подобрана так, чтобы к 10.5 минутам — средней
-        длительности кормления в исследовании с контрольным взвешиванием
-        доношенных — передавалось около 93 % объёма.
-        {t.refMin != null && <> Ваша медианная длительность — {Math.round(t.refMin)} мин,
-        при ней кривая даёт ровно типичный объём.</>}
-      </p>
-      <p className="hint">
-        Из литературы взята только ФОРМА кривой. Величина — своя: в том же
-        исследовании при средних 119.5 г на кормление разброс был 34–222 г,
-        то есть шестикратный, и брать оттуда абсолютные миллилитры
-        бессмысленно.
-      </p>
-      <p className="hint">
-        Объём кормления для груди никто не измеряет — это главная слабость
-        расчёта. Он выводится из суточного объёма по возрасту
-        ({t.measured ? "вес взят из последнего взвешивания" : "вес подставлен как медиана ВОЗ — запишите взвешивание, и он станет вашим"}),
-        делённого на ваше собственное число кормлений. Для смеси берётся
-        введённый объём.
-      </p>
-      <p className="hint">
-        Пропуск в записях сам по себе ничего не значит. Но если промежуток
-        закрыт отмеченным сном, приложение знает, что ребёнок не ел, —
-        и считает промежуток настоящим. Длинный промежуток без сна и без
-        записей считается дыркой в дневнике, и напоминание тогда
-        не приходит.
-      </p>
-      <p className="hint">
-        Через три часа от прошлого кормления в желудке остаётся около
-        десятой части — поэтому расчёт «забывает» пропущенный кусок дня
-        сам собой, и одного отмеченного кормления хватает, чтобы он снова
-        стал осмысленным.
-      </p>
-      <p className="hint">
-        Обучения на собственных подсказках здесь нет намеренно: иначе
-        вышла бы та же петля, что с окнами сна — приложение предложило
-        время, вы покормили, приложение посчитало собственный сдвиг
-        фактом о ребёнке.
+        Приложение считает не голод, а освободился ли желудок — поэтому
+        везде «можно кормить», а не «пора». Как именно считается —
+        в настройках ⚙️, раздел «Как считается».
       </p>
     </div>
   );
@@ -2185,27 +2268,17 @@ function MeasureView({ ind, profile, events, now, onAdd, onSex, onPick }) {
       </div>
       <p className="hint">Нажмите на запись, чтобы поправить значение или дату.</p>
 
-      <div className="sec">Откуда цифры</div>
       <div className="bt-card">
         <p className="hint" style={{ marginTop: 0 }}>
-          Кривые — WHO Child Growth Standards (2006), таблицы L/M/S:
-          по неделям до 13 недель и по месяцам
-          до {ind.maxMonths === 24 ? "двух лет" : "пяти лет"}. Перцентиль
-          считается из z-оценки по этим параметрам, а не берётся из готовой
-          таблицы, поэтому промежуточные возрасты считаются точно, а не
-          округляются до ближайшей недели.
-        </p>
-        <p className="hint">
-          Стандарт построен на доношенных детях. Для родившегося раньше срока
-          возраст положено считать скорректированным — приложение этого
-          не умеет, и его перцентиль будет занижен.
-        </p>
-        <p className="hint">{MEASURE_NOTE[ind.key]}</p>
-        <p className="hint">
-          Пол: {SEX_LABEL[sex]}.{" "}
+          Кривые — стандарты ВОЗ (2006) для {SEX_GEN[sex]}.{" "}
           <button className="linkish" onClick={() => onSex(sex === "m" ? "f" : "m")}>
-            Изменить
+            Изменить пол
           </button>
+        </p>
+        <p className="hint">
+          {ind.key === "weight"
+            ? "Взвешивайте раз в неделю-две: разброс между двумя измерениями подряд сопоставим с недельной прибавкой."
+            : "Домашние измерения здесь неточны — цифрам с приёма доверяйте больше. Как считается — в настройках ⚙️."}
         </p>
       </div>
     </>

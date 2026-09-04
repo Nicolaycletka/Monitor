@@ -23,7 +23,16 @@ button { font: inherit; }
 .bt-card.list { padding: 4px 14px; }
 
 .rib-wrap { margin-bottom: 14px; }
-.rib { position: relative; height: 34px; border-radius: 9px; background: #191622; overflow: hidden; border: 1px solid #262232; }
+.rib {
+  position: relative; height: 34px; border-radius: 9px; overflow: hidden; border: 1px solid #262232;
+  background-color: #191622;
+  /* часовая сетка: тонкая линия каждый час, ровно 24 деления на всю ширину */
+  background-image: repeating-linear-gradient(
+    to right,
+    rgba(255,255,255,.07) 0, rgba(255,255,255,.07) 1px,
+    transparent 1px, transparent calc(100% / 24)
+  );
+}
 .rib-seg { position: absolute; top: 0; bottom: 0; background: linear-gradient(180deg, #6c7bd9, #5563b8); }
 .rib-seg.live { background: linear-gradient(180deg, #8a97e6, #6c7bd9); }
 .rib-tick { position: absolute; bottom: 0; width: 2px; height: 8px; background: #e8a33d; opacity: .85; }
@@ -197,3 +206,34 @@ button:focus-visible, input:focus-visible { outline: 2px solid #8a97e6; outline-
 .gear-b { position: absolute; right: 0; top: 50%; transform: translateY(-50%); background: none; border: none; color: #8a8299; padding: 6px; cursor: pointer; }
 .gear-b:hover { color: #ede6ff; }
 .settings-sheet { max-height: 82vh; overflow-y: auto; }
+
+/* раскрывающиеся разделы «Как считается» в настройках */
+.info-block { padding: 0; overflow: hidden; }
+.info-h { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 10px; background: none; border: none; color: #ded7f0; padding: 14px 16px; font-size: 14px; text-align: left; cursor: pointer; }
+.info-x { color: #6f677f; font-size: 18px; line-height: 1; flex: none; }
+.info-body { padding: 0 16px 14px; border-top: 1px solid #2b2739; }
+.info-body .hint:first-child { margin-top: 12px; }
+
+/*
+ * Разный фон у разделов — подсказка «вы в другом месте» без лишней
+ * подписи. Оттенки намеренно сдержанные: это дневник, в который
+ * смотрят ночью полусонными, и заметная разница в яркости резала бы
+ * глаза. «Трекер» уходит в холодный сине-фиолетовый (цвет сна в
+ * ленте), «Здоровье» — в тёплый зеленоватый (цвет диаграмм роста).
+ *
+ * Красится и body тоже: иначе при оттягивании страницы за край
+ * (overscroll) из-под приложения выглядывал бы прежний фон.
+ */
+.bt { min-height: 100%; transition: background-color .25s ease; }
+.bt.sec-sleep { background-color: #14121c; }
+.bt.sec-health { background-color: #121a17; }
+
+body:has(.bt.sec-sleep) { background: #14121c; }
+body:has(.bt.sec-health) { background: #121a17; }
+
+/* карточки и лента чуть подстраиваются, чтобы не «висеть» на чужом фоне */
+.sec-health .bt-card { background: #182220; border-color: #26332e; }
+.sec-health .rib { background-color: #16201d; border-color: #253430; }
+.sec-health .seg { background: #182220; border-color: #26332e; }
+.sec-health .seg-b.on { background: #26332e; }
+.sec-health .tabs { background: rgba(18, 26, 23, .94); border-top-color: #253430; }
