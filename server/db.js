@@ -109,15 +109,54 @@ for (const [c, t] of [
   if (!has) db.exec(`ALTER TABLE notifications ADD COLUMN ${c} ${t}`);
 }
 
+/*
+ * Разовая чистка застрявших уведомлений о вехах развития.
+ *
+ * Пока `dueNotifications` не выбирал охранные колонки, НИ ОДИН пуш
+ * вида `dev` не мог быть доставлен: сверка снимка дат срабатывала
+ * всегда, а `sent = 1` при этом уже стоял. То есть в базе осталась
+ * строка, помеченная отправленной, хотя родитель ничего не получил.
+ * Дальше она блокирует всё: клиент присылает то же самое время,
+ * `putNotify` видит `current.at === at` и выходит, не трогая `sent`.
+ * Веха не уйдёт никогда — ни эта, ни следующая, пока эта не сменится.
+ *
+ * Удалять безопасно ИМЕННО потому, что доставки не было ни разу:
+ * дубликата возникнуть не из чего. Клиент на ближайшем синке поставит
+ * веху заново, и если она ещё в окне подхвата (`CATCH_UP_MS`) — она
+ * дойдёт.
+ *
+ * Одноразовость держится на `user_version`, а не на факте наличия
+ * строки: иначе чистка повторялась бы при каждом рестарте и стирала
+ * уже честно отправленную веху — родитель получал бы её повторно.
+ */
+if (db.pragma("user_version", { simple: true }) < 1) {
+  const n = db.prepare("DELETE FROM notifications WHERE kind = 'dev'").run().changes;
+  db.pragma("user_version = 1");
+  if (n) console.log(`очищено застрявших уведомлений о вехах: ${n}`);
+}
+
 /* ------------------------------------------------------------------ */
 
 export const findHousehold = db.prepare(
   "SELECT * FROM households WHERE token_hash = ?"
 );
 
+/*
+ * БЫЛ БАГ: `due_at` не было ни в списке колонок, ни в VALUES, хотя
+ * index.js честно передавал его в объекте параметров. better-sqlite3
+ * ЛИШНИЙ именованный параметр не отвергает — молча проглатывает
+ * (проверено), поэтому ошибки не было ни в логах, ни в ответе: семья
+ * создавалась, ПДР исчезала. Всплывало это только на пушах о вехах:
+ * клиент шлёт снимок `guardDueAt` со своей ПДР, сервер сверяет его
+ * с `households.due_at` = NULL, не сходится — и пуш отменяется НАВСЕГДА.
+ *
+ * Лишний параметр, который никуда не пишется, — ошибка, которую не
+ * поймает ни один тест на «создалось ли». Проверять надо ЗНАЧЕНИЕ
+ * в базе, а не факт успешного вызова.
+ */
 export const insertHousehold = db.prepare(`
-  INSERT INTO households (id, token_hash, name, birth, sex, profile_updated_at, created_at)
-  VALUES (@id, @token_hash, @name, @birth, @sex, @profile_updated_at, @created_at)
+  INSERT INTO households (id, token_hash, name, birth, sex, due_at, profile_updated_at, created_at)
+  VALUES (@id, @token_hash, @name, @birth, @sex, @due_at, @profile_updated_at, @created_at)
 `);
 
 /*

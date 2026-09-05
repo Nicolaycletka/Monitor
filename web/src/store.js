@@ -344,6 +344,28 @@ export async function syncOnce(state) {
     profileDirty = false;
   }
 
+  /*
+   * Сервер мог вернуть профиль, в котором наших полей нет: старая
+   * версия сервера — или потерянная при создании семьи ПДР (её не
+   * писал `insertHousehold`). Слияние выше локальное значение бережно
+   * сохраняет, но обратно на сервер оно уже не уедет: профиль уходит,
+   * только пока стоит `profileDirty`. Получалась тихая вечная
+   * рассинхронизация, видимая лишь по тому, что пуши о вехах не
+   * доходят: их снимок дат сверяется с серверной копией.
+   *
+   * Поэтому расхождение помечаем к дозаписи. `updatedAt` при этом
+   * обязательно двигаем: на сервере запись профиля закрыта условием
+   * `profile_updated_at < @updated_at`, и без сдвига UPDATE молча не
+   * сделал бы ничего — а `profileDirty` вставал бы снова на каждом
+   * синке. Сходится за один круг: следующий ответ уже совпадёт.
+   */
+  if (data.profile && profile && (
+        (profile.dueAt ?? null) !== (data.profile.dueAt ?? null) ||
+        (profile.sex ?? null) !== (data.profile.sex ?? null))) {
+    profile = { ...profile, updatedAt: Date.now() };
+    profileDirty = true;
+  }
+
   return { ...state, events, profile, profileDirty, rev: data.rev };
 }
 

@@ -382,6 +382,38 @@ if (telegramEnabled()) {
     }
   })();
 
+  /*
+   * Отдельная сверка для вех развития: если родитель поправил ПДР или
+   * дату рождения ПОСЛЕ того, как был посчитан этот пуш, текст и момент
+   * могли устареть (скачок целиком считается от другой даты). Дневник
+   * тут ни при чём, поэтому это не newerEventSince, а прямое сравнение
+   * снимка с текущим значением в профиле.
+   *
+   * Несовпадение ОТКЛАДЫВАЕТ пуш, а не съедает: клиент на ближайшем
+   * синке пересчитает веху от новых дат и перевзведёт очередь другим
+   * временем, перезаписав эту строку. Раньше здесь стоял `continue`
+   * после `markNotificationSent`, и любое расхождение — включая
+   * вызванное потерей `due_at` при создании семьи — теряло веху
+   * навсегда и молча. Молчание было самым дорогим: снаружи это
+   * выглядело как «пуш просто не пришёл», без единой зацепки.
+   */
+  const warnedDevDates = new Set();
+
+  function devDatesMatch(n) {
+    const cur = householdDates.get(n.id);
+    if (!cur) return true; // семьи нет — не наше дело, решит следующая проверка
+    const ok = (cur.due_at || null) === (n.guard_due_at || null) && cur.birth === n.guard_birth_at;
+    if (!ok && !warnedDevDates.has(n.id)) {
+      warnedDevDates.add(n.id);
+      console.warn(
+        "веха отложена: снимок дат не сходится с профилем " +
+        `(семья ${n.id}; рождение ${n.guard_birth_at} против ${cur.birth}, ` +
+        `ПДР ${n.guard_due_at} против ${cur.due_at})`
+      );
+    }
+    return ok;
+  }
+
   setInterval(async () => {
     const due = dueNotifications.all(Date.now());
     for (const n of due) {
@@ -406,6 +438,8 @@ if (telegramEnabled()) {
       const asleep = last && last.finish === null;
       if (asleep && n.kind === "dev") continue; // отложить, не помечая
 
+      if (n.kind === "dev" && !devDatesMatch(n)) continue; // тоже отложить
+
       // помечаем сразу, чтобы сбой отправки не привёл к повтору на
       // следующем тике планировщика
       markNotificationSent.run(n.id, n.kind);
@@ -420,20 +454,6 @@ if (telegramEnabled()) {
       if (n.guard_type && Number.isFinite(n.guard_after)) {
         const changed = newerEventSince.get(n.id, n.guard_type, n.guard_after);
         if (changed && changed.n > 0) continue;
-      }
-
-      /*
-       * Отдельная сверка для вех развития: если родитель поправил ПДР
-       * или дату рождения ПОСЛЕ того, как был посчитан этот пуш, текст
-       * и момент могли устареть (скачок целиком считается от другой
-       * даты). Дневник тут ни при чём, поэтому это не newerEventSince,
-       * а прямое сравнение снимка с текущим значением в профиле.
-       */
-      if (n.kind === "dev") {
-        const now2 = householdDates.get(n.id);
-        if (now2 && ((now2.due_at || null) !== (n.guard_due_at || null) || now2.birth !== n.guard_birth_at)) {
-          continue;
-        }
       }
 
       const chats = telegramChatsFor.all(n.id);
