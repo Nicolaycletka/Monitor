@@ -225,7 +225,8 @@ function computeNotify(state) {
   const dev = nextMilestone(birth, state.profile?.dueAt ?? null, Date.now());
   const devN = dev && {
     at: devPushTime(dev.at, Date.now()),
-    text: `🌱 ${dev.text}`,
+    text: dev.text, // эмодзи и заголовок уже внутри текста вехи
+
     guardDueAt: state.profile?.dueAt ?? null,
     guardBirthAt: birth,
   };

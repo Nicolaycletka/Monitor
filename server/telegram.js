@@ -33,8 +33,45 @@ export async function tgCall(method, params) {
   return data.result;
 }
 
+/** Жёсткий лимит Telegram на одно сообщение. */
+const TG_LIMIT = 4096;
+
+/*
+ * Режем длинный текст по абзацам, а не по символам: рвать фразу
+ * посередине хуже, чем прислать два сообщения. Если один абзац сам
+ * длиннее лимита — режем его по символам, деваться некуда.
+ */
+export function splitMessage(text, limit = TG_LIMIT) {
+  if (text.length <= limit) return [text];
+  const parts = [];
+  let buf = "";
+  for (const para of text.split("\n\n")) {
+    const chunk = buf ? `${buf}\n\n${para}` : para;
+    if (chunk.length <= limit) { buf = chunk; continue; }
+    if (buf) { parts.push(buf); buf = ""; }
+    if (para.length <= limit) { buf = para; continue; }
+    for (let i = 0; i < para.length; i += limit) parts.push(para.slice(i, i + limit));
+  }
+  if (buf) parts.push(buf);
+  return parts;
+}
+
+/*
+ * Тексты вех развития длиннее прежних напоминаний о сне в разы, и
+ * превышение лимита Telegram возвращает ошибку — а уведомление к тому
+ * моменту уже помечено отправленным, то есть пропало бы молча. Ровно
+ * тот способ потерять пуш, который в этом проекте уже случался, так
+ * что длину проверяем здесь, а не надеемся на дисциплину авторов
+ * текстов.
+ */
 export async function sendMessage(chatId, text) {
-  return tgCall("sendMessage", { chat_id: chatId, text });
+  const parts = splitMessage(String(text ?? ""));
+  let last = null;
+  for (const part of parts) {
+    last = await tgCall("sendMessage", { chat_id: chatId, text: part });
+    if (!last) return null; // не сыпем продолжением, если первая часть не ушла
+  }
+  return last;
 }
 
 export async function getMe() {

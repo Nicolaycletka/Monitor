@@ -1334,7 +1334,7 @@ function MilestonesCard({ state }) {
           </div>
           {ov.next && (
             <p className="hint">
-              Ближайшее — {dayLabel(ov.next.at)}: «{ov.next.text.slice(0, 90)}…»
+              Ближайшее — {dayLabel(ov.next.at)}: {ov.next.lead}
             </p>
           )}
         </>
