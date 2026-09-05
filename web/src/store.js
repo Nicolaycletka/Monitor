@@ -176,15 +176,63 @@ const NOTIFY_MERGE_MIN = 20;
  */
 const toMinute = (ts) => Math.round(ts / 60000) * 60000;
 
+/** Границы, в которые сдвигается пуш о вехе развития, часы местного времени. */
+const DEV_PUSH_FROM = 9;
+const DEV_PUSH_TO = 22;
+
+/*
+ * Момент вехи — чистая арифметика от даты рождения (или ПДР), и время
+ * суток у него какое угодно. У скачков оно вообще всегда равно времени
+ * суток самой точки отсчёта: если ПДР записана как дата без времени,
+ * ВСЕ скачки приходятся ровно на полночь.
+ *
+ * Календарной заметке безразлично, придёт она в 00:00 или в 09:00,
+ * а родителю — нет. Поэтому пуш сдвигается в дневные часы. Сдвиг
+ * детерминирован (функция только от `at`), иначе сервер видел бы новое
+ * время на каждом синке и перевзводил очередь.
+ *
+ * Пропущенную веху (подхват в пределах CATCH_UP_MS) не сдвигаем: она
+ * уже опоздала, шлём при первой возможности.
+ */
+function devPushTime(at, now = Date.now()) {
+  if (at <= now) return at;
+  const d = new Date(at);
+  const h = d.getHours();
+  if (h >= DEV_PUSH_FROM && h < DEV_PUSH_TO) return at;
+  if (h >= DEV_PUSH_TO) d.setDate(d.getDate() + 1);
+  d.setHours(DEV_PUSH_FROM, 0, 0, 0);
+  return d.getTime();
+}
+
 function computeNotify(state) {
   if (!state.profile?.birth) return null;
   const events = liveEvents(state.events || []);
   const { birth, sex, name } = state.profile;
   const active = events.find((e) => e.type === "sleep" && !e.end);
 
+  /*
+   * Вехи развития — календарь, а не прогноз: спящий ребёнок ничему не
+   * мешает, окно кормления рядом тоже не имеет значения, слияние
+   * с другими видами не нужно. Единственная защита — снимок дат,
+   * который сверяется на сервере перед отправкой (см. server/index.js).
+   *
+   * Считается ДО ветки спящего ребёнка. Раньше эта ветка возвращала
+   * объект без ключа `dev` вовсе, сервер такой ключ не трогал — и пока
+   * ребёнок спит, веха не могла даже встать в очередь. Вместе с тем,
+   * что синк во сне — самый частый (родитель как раз открывает дневник,
+   * чтобы отметить сон), окно постановки сжималось почти в ноль.
+   */
+  const dev = nextMilestone(birth, state.profile?.dueAt ?? null, Date.now());
+  const devN = dev && {
+    at: devPushTime(dev.at, Date.now()),
+    text: `🌱 ${dev.text}`,
+    guardDueAt: state.profile?.dueAt ?? null,
+    guardBirthAt: birth,
+  };
+
   // ребёнок спит — оба напоминания снимаются: и укладывать уже не надо,
   // и будить кормлением тем более
-  if (active) return { sleep: null, feed: null };
+  if (active) return { sleep: null, feed: null, dev: devN };
 
   let sleepN = null;
   const win = predictNext(events, birth, Date.now(), state.bias || 0);
@@ -222,20 +270,6 @@ function computeNotify(state) {
   if (sleepN && feedN && Math.abs(feedN.at - sleepN.at) < NOTIFY_MERGE_MIN * 60000) {
     feedN = null;
   }
-
-  /*
-   * Вехи развития — календарь, а не прогноз: спящий ребёнок ничему не
-   * мешает, окно кормления рядом тоже не имеет значения, слияние
-   * с другими видами не нужно. Единственная защита — снимок дат,
-   * который сверяется на сервере перед отправкой (см. server/index.js).
-   */
-  const dev = nextMilestone(birth, state.profile?.dueAt ?? null, Date.now());
-  const devN = dev && {
-    at: dev.at,
-    text: `🌱 ${dev.text}`,
-    guardDueAt: state.profile?.dueAt ?? null,
-    guardBirthAt: birth,
-  };
 
   return { sleep: sleepN, feed: feedN, dev: devN };
 }

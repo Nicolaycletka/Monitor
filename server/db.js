@@ -192,13 +192,22 @@ export const markNotificationSent = db.prepare(
 );
 
 /*
+ * ВНИМАНИЕ к списку колонок: планировщик сверяет `guard_due_at` и
+ * `guard_birth_at` со снимком в профиле. Если их не выбрать, в объекте
+ * они станут `undefined`, сравнение `now2.birth !== n.guard_birth_at`
+ * окажется истинным ВСЕГДА, и ни один пуш вида `dev` не уедет никогда.
+ * Ровно это и случилось: колонки добавили в таблицу и в INSERT, а
+ * SELECT остался прежним. Добавляя охранное поле — добавляйте его
+ * во ВСЕ ТРИ места.
+ *
  * Отключённые виды отсекаются прямо в запросе: если родитель выключил
  * напоминания о кормлении, накопившаяся очередь не должна выстрелить
  * при обратном включении. Строка вида "feed,sleep" ищется с запятыми
  * по краям, иначе "feed" совпал бы с "feeding".
  */
 export const dueNotifications = db.prepare(`
-  SELECT n.household_id AS id, n.kind, n.at, n.text, n.guard_type, n.guard_after
+  SELECT n.household_id AS id, n.kind, n.at, n.text, n.guard_type, n.guard_after,
+         n.guard_due_at, n.guard_birth_at
   FROM notifications n
   JOIN households h ON h.id = n.household_id
   WHERE n.sent = 0 AND n.at <= ?
