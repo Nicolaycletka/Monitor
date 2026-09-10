@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import express from "express";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
@@ -23,6 +24,15 @@ import {
   lastSleepEvent,
   linkTelegramChat,
   telegramChatsFor,
+  findMemberByToken,
+  insertMember,
+  listMembers,
+  touchMember,
+  revokeMember,
+  countActiveParents,
+  insertInvite,
+  findInvite,
+  useInvite,
 } from "./db.js";
 import { telegramEnabled, sendMessage, getMe, deleteWebhook, getUpdates } from "./telegram.js";
 
@@ -31,6 +41,33 @@ const PORT = Number(process.env.PORT || 8090);
 // "" для корня, "/monitor" для подкаталога
 const BASE = (process.env.BASE_PATH || "").replace(/\/+$/, "");
 const STATIC_DIR = process.env.STATIC_DIR || join(__dirname, "..", "web", "dist");
+
+/*
+ * Идентификатор сборки фронтенда — имя собранного JS-файла из
+ * index.html (vite подставляет в него хеш содержимого). Клиент узнаёт
+ * СВОЙ идентификатор из `import.meta.url`, то есть из имени файла, из
+ * которого он сам загружен: оба значения выводятся из одного артефакта,
+ * никакой отдельной нумерации версий заводить не нужно.
+ *
+ * Зачем вообще. Тексты вех живут в бандле НА ТЕЛЕФОНЕ и приезжают на
+ * сервер уже готовой строкой. Значит залипший клиент молча шлёт старый
+ * контент, а снаружи это выглядит как «пуш пришёл не тот» — ровно так
+ * и случилось. Service worker тут не спасает: файл sw.js между
+ * деплоями не меняется, браузеру нечего заметить, а PWA, которую не
+ * закрывали, при возврате из фона навигацию не делает и новый
+ * index.html не запрашивает.
+ *
+ * Читаем один раз при старте: контейнер пересобирается вместе с
+ * фронтендом, так что в живом процессе это значение поменяться не может.
+ */
+const BUILD = (() => {
+  try {
+    const html = readFileSync(join(STATIC_DIR, "index.html"), "utf8");
+    return html.match(/assets\/([A-Za-z0-9._-]+\.js)/)?.[1] || null;
+  } catch {
+    return null; // дев-режим: фронтенд отдаёт vite, dist ещё нет
+  }
+})();
 
 const app = express();
 app.disable("x-powered-by");
@@ -53,18 +90,80 @@ function throttle(req, res, next) {
 
 const hash = (t) => crypto.createHash("sha256").update(t).digest("hex");
 
+/*
+ * Опознание идёт по строке УЧАСТНИКА, а не по общему токену семьи.
+ * Прежний общий токен при миграции стал обычным участником с ролью
+ * parent (см. db.js), поэтому подключённые телефоны продолжают
+ * работать без переподключения.
+ *
+ * Отозванный участник не находится вовсе — запрос получает 401, тот
+ * же ответ, что и при неправильном токене. Специального «доступ
+ * отозван» на сервере нет намеренно: снаружи это лишний сигнал
+ * тому, кто перебирает токены.
+ */
 function auth(req, res, next) {
   const header = req.get("authorization") || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : "";
   if (!token) return res.status(401).json({ error: "no_token" });
-  const row = findHousehold.get(hash(token));
-  if (!row) {
+
+  const member = findMemberByToken.get(hash(token));
+  const row = member ? findHouseholdById.get(member.household_id) : null;
+  if (!member || !row) {
     attempts.set(req.ip, (attempts.get(req.ip) || 0) + 1);
     return res.status(401).json({ error: "bad_token" });
   }
+
+  touchMember.run(Date.now(), member.id);
   req.household = row;
+  req.member = member;
   next();
 }
+
+/** Роль viewer читает, но ничего не меняет. Проверка ТОЛЬКО здесь: в
+ *  интерфейсе кнопки можно спрятать, но запрос никто не мешает послать
+ *  руками, поэтому решает сервер. */
+function requireParent(req, res, next) {
+  if (req.member?.role !== "parent") return res.status(403).json({ error: "read_only" });
+  next();
+}
+
+/* ---------- CORS для автономного приложения ---------- */
+
+/*
+ * В вебе CORS не нужен: приложение и API отдаёт один и тот же сервер.
+ * Автономный APK — другое дело: его файлы лежат внутри приложения и
+ * открываются с origin `https://localhost`, то есть КАЖДЫЙ запрос к
+ * API становится межсайтовым.
+ *
+ * Список источников закрытый и задаётся через CORS_ORIGINS. Отражать
+ * присланный Origin обратно (частый приём) здесь нельзя: токен ездит
+ * в заголовке, любой сайт в браузере пользователя смог бы тогда
+ * дёргать API от его имени, если бы токен утёк в страницу.
+ *
+ * Учётные данные (`credentials`) не разрешаем намеренно: авторизация
+ * идёт заголовком Authorization, а не куками, поэтому браузеру нечего
+ * прикладывать — и CSRF в принципе неоткуда взяться.
+ */
+const CORS_ORIGINS = new Set(
+  (process.env.CORS_ORIGINS || "https://localhost,capacitor://localhost")
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean)
+);
+
+r.use("/api", (req, res, next) => {
+  const origin = req.get("origin");
+  if (origin && CORS_ORIGINS.has(origin)) {
+    res.set("Access-Control-Allow-Origin", origin);
+    res.set("Vary", "Origin");
+    res.set("Access-Control-Allow-Headers", "authorization, content-type");
+    res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.set("Access-Control-Max-Age", "86400");
+  }
+  // предварительный запрос браузера: до обработчиков его пускать незачем
+  if (req.method === "OPTIONS") return res.sendStatus(origin && CORS_ORIGINS.has(origin) ? 204 : 403);
+  next();
+});
 
 /* ---------- создание семьи ---------- */
 
@@ -78,17 +177,38 @@ r.post("/api/household", throttle, (req, res) => {
   }
   const token = crypto.randomBytes(32).toString("base64url");
   const id = crypto.randomUUID();
-  insertHousehold.run({
-    id,
-    token_hash: hash(token),
-    name: name.trim().slice(0, 60),
-    birth,
-    sex,
-    due_at: dueAt,
-    profile_updated_at: Date.now(),
-    created_at: Date.now(),
-  });
-  res.json({ householdId: id, token });
+  const memberId = crypto.randomUUID();
+  const now = Date.now();
+
+  /*
+   * Семья и её первый участник заводятся ОДНОЙ транзакцией. Раздельно
+   * нельзя: миграция общих токенов в участников одноразовая и работает
+   * только при старте, так что семья, созданная без строки участника,
+   * получила бы 401 на первом же синке — и починить это было бы нечем,
+   * токен на руках, а войти по нему некуда.
+   */
+  db.transaction(() => {
+    insertHousehold.run({
+      id,
+      token_hash: hash(token),
+      name: name.trim().slice(0, 60),
+      birth,
+      sex,
+      due_at: dueAt,
+      profile_updated_at: now,
+      created_at: now,
+    });
+    insertMember.run({
+      id: memberId,
+      household_id: id,
+      name: "",
+      role: "parent",
+      token_hash: hash(token),
+      created_at: now,
+    });
+  })();
+
+  res.json({ householdId: id, token, member: { id: memberId, name: "", role: "parent" } });
 });
 
 /* ---------- синхронизация ---------- */
@@ -249,11 +369,26 @@ function applyNotify(hid, notify) {
   }
 }
 
+/** Кто есть кто — уходит клиенту, чтобы он знал, что прятать. */
+const memberInfo = (m) => ({ id: m.id, name: m.name, role: m.role });
+
 r.post("/api/sync", throttle, auth, (req, res) => {
   const hid = req.household.id;
   const since = Number(req.body?.since) || 0;
-  const incoming = Array.isArray(req.body?.events) ? req.body.events.slice(0, 2000) : [];
-  const profile = req.body?.profile;
+
+  /*
+   * Единственная точка записи во всём API — поэтому режим «только
+   * чтение» стоит здесь одной проверкой, а не рассыпан по обработчикам.
+   * Присланное зрителем не отвергаем ошибкой, а молча игнорируем: его
+   * приложение и так не должно ничего слать, а если пришло — значит
+   * либо устаревший клиент, либо ручной запрос, и в обоих случаях
+   * полезнее отдать данные, чем свалить синхронизацию.
+   */
+  const canWrite = req.member.role === "parent";
+  const incoming = canWrite && Array.isArray(req.body?.events)
+    ? req.body.events.slice(0, 2000)
+    : [];
+  const profile = canWrite ? req.body?.profile : undefined;
 
   const apply = db.transaction(() => {
     let rev = maxRev.get(hid).rev;
@@ -292,7 +427,9 @@ r.post("/api/sync", throttle, auth, (req, res) => {
      * котором приложение ещё не обновилось. Без поддержки старой
      * формы напоминания о сне на нём молча перестали бы приходить.
      */
-    applyNotify(hid, req.body?.notify);
+    // очередь уведомлений семьи — тоже запись: зритель её не трогает,
+    // иначе телефон бабушки перебивал бы расчёты родителей
+    if (canWrite) applyNotify(hid, req.body?.notify);
   });
 
   apply();
@@ -314,7 +451,111 @@ r.post("/api/sync", throttle, auth, (req, res) => {
       updatedAt: current.profile_updated_at,
     },
     serverTime: Date.now(),
+    build: BUILD,
+    member: memberInfo(req.member),
   });
+});
+
+/* ---------- участники семьи ---------- */
+
+const INVITE_TTL_MS = 24 * 3600 * 1000;
+
+/*
+ * Код приглашения. Короткий, но из 32 случайных байт: его набирают
+ * руками редко (обычно переходят по ссылке), зато он живёт сутки и
+ * сгорает при первом использовании — в отличие от прежней ссылки,
+ * которая содержала настоящий токен и работала вечно.
+ */
+r.post("/api/invites", throttle, auth, requireParent, (req, res) => {
+  const role = req.body?.role === "viewer" ? "viewer" : "parent";
+  const name = String(req.body?.name || "").trim().slice(0, 40);
+  const code = crypto.randomBytes(24).toString("base64url");
+  const now = Date.now();
+  insertInvite.run({
+    code_hash: hash(code),
+    household_id: req.household.id,
+    role,
+    name,
+    created_at: now,
+    expires_at: now + INVITE_TTL_MS,
+  });
+  res.json({ code, role, name, expiresAt: now + INVITE_TTL_MS });
+});
+
+/*
+ * Обмен кода на собственный токен. Без auth — приглашённый ещё никто.
+ * Отсюда же и throttle: это единственный маршрут, где посторонний
+ * может подбирать секрет.
+ */
+r.post("/api/join", throttle, (req, res) => {
+  const code = String(req.body?.code || "");
+  if (!code) return res.status(400).json({ error: "no_code" });
+
+  const inv = findInvite.get(hash(code));
+  const now = Date.now();
+  if (!inv || inv.used_at || inv.expires_at < now) {
+    attempts.set(req.ip, (attempts.get(req.ip) || 0) + 1);
+    return res.status(404).json({ error: "bad_invite" });
+  }
+
+  const token = crypto.randomBytes(32).toString("base64url");
+  const id = crypto.randomUUID();
+  const name = String(req.body?.name || inv.name || "").trim().slice(0, 40);
+
+  /*
+   * Транзакция обязательна: два телефона могут открыть одну ссылку
+   * одновременно. Гасим приглашение УСЛОВНЫМ обновлением (used_at IS
+   * NULL) и проверяем changes — проигравший получит 404, а не второй
+   * доступ по тому же коду.
+   */
+  const done = db.transaction(() => {
+    if (useInvite.run(now, id, hash(code)).changes !== 1) return false;
+    insertMember.run({
+      id,
+      household_id: inv.household_id,
+      name,
+      role: inv.role,
+      token_hash: hash(token),
+      created_at: now,
+    });
+    return true;
+  })();
+
+  if (!done) return res.status(404).json({ error: "bad_invite" });
+  res.json({ token, householdId: inv.household_id, member: { id, name, role: inv.role } });
+});
+
+r.get("/api/members", auth, (req, res) => {
+  res.json({
+    members: listMembers.all(req.household.id).map((m) => ({
+      id: m.id,
+      name: m.name,
+      role: m.role,
+      createdAt: m.created_at,
+      lastSeenAt: m.last_seen_at,
+      revokedAt: m.revoked_at,
+      me: m.id === req.member.id,
+    })),
+  });
+});
+
+r.post("/api/members/:id/revoke", throttle, auth, requireParent, (req, res) => {
+  const id = String(req.params.id || "");
+
+  // себя отзывать нельзя: это мгновенная потеря доступа с того же
+  // устройства, с которого нажали, и вернуть его будет нечем
+  if (id === req.member.id) return res.status(400).json({ error: "self_revoke" });
+
+  const target = listMembers.all(req.household.id).find((m) => m.id === id);
+  if (!target || target.revoked_at) return res.status(404).json({ error: "no_member" });
+
+  // и последнего родителя тоже: семья осталась бы без права записи
+  if (target.role === "parent" && countActiveParents.get(req.household.id).n <= 1) {
+    return res.status(400).json({ error: "last_parent" });
+  }
+
+  revokeMember.run(Date.now(), id, req.household.id);
+  res.json({ ok: true });
 });
 
 r.get("/api/health", (_req, res) => res.json({ ok: true }));
@@ -323,7 +564,7 @@ r.get("/api/health", (_req, res) => res.json({ ok: true }));
 
 let botUsername = null;
 
-r.get("/api/telegram-link", auth, (req, res) => {
+r.get("/api/telegram-link", auth, requireParent, (req, res) => {
   if (!telegramEnabled()) return res.status(503).json({ error: "telegram_disabled" });
   if (!botUsername) return res.status(503).json({ error: "bot_not_ready" });
   res.json({ url: `https://t.me/${botUsername}?start=${req.household.id}` });

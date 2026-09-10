@@ -61,6 +61,57 @@ CREATE TABLE IF NOT EXISTS notifications (
 
 CREATE INDEX IF NOT EXISTS idx_notif_due ON notifications(sent, at);
 
+/*
+ * Участники семьи. До этого доступ был устроен как ОДИН общий токен
+ * на семью (households.token_hash), который раздавался ссылкой. Из
+ * этого следовало три неприятности: отозвать доступ у одного человека
+ * было нельзя — только сменить токен всем сразу; сколько людей держат
+ * ссылку, никто не знал; а сама ссылка с настоящим токеном оставалась
+ * в переписке навсегда.
+ *
+ * Теперь у каждого свой токен и роль: parent пишет и приглашает,
+ * viewer только смотрит. Отзыв — проставление revoked_at, а не
+ * удаление строки: полезно видеть, что доступ был и когда закрыт.
+ *
+ * Старый общий токен при миграции становится обычной строкой-родителем
+ * (см. user_version = 2 ниже), поэтому уже подключённые телефоны после
+ * обновления НЕ разлогиниваются. Обратная сторона — старые ссылки
+ * продолжают работать, пока эту строку не отозвать вручную.
+ */
+CREATE TABLE IF NOT EXISTS members (
+  id            TEXT PRIMARY KEY,
+  household_id  TEXT NOT NULL REFERENCES households(id) ON DELETE CASCADE,
+  name          TEXT NOT NULL DEFAULT '',
+  role          TEXT NOT NULL DEFAULT 'parent',
+  token_hash    TEXT UNIQUE NOT NULL,
+  created_at    INTEGER NOT NULL,
+  last_seen_at  INTEGER,
+  revoked_at    INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_members_household ON members(household_id);
+
+/*
+ * Приглашения. Одноразовый код, который обменивается на собственный
+ * токен участника, — вместо раздачи настоящего токена ссылкой.
+ * Разница принципиальная: код живёт сутки и сгорает при первом
+ * использовании, поэтому оставшаяся в переписке ссылка через день
+ * бесполезна, а раньше она была ключом навсегда.
+ *
+ * Храним хеш кода, а не сам код: база и её резервные копии не должны
+ * содержать ничего, чем можно войти.
+ */
+CREATE TABLE IF NOT EXISTS invites (
+  code_hash     TEXT PRIMARY KEY,
+  household_id  TEXT NOT NULL REFERENCES households(id) ON DELETE CASCADE,
+  role          TEXT NOT NULL,
+  name          TEXT NOT NULL DEFAULT '',
+  created_at    INTEGER NOT NULL,
+  expires_at    INTEGER NOT NULL,
+  used_at       INTEGER,
+  used_by       TEXT
+);
+
 CREATE TABLE IF NOT EXISTS telegram_links (
   household_id  TEXT NOT NULL REFERENCES households(id) ON DELETE CASCADE,
   chat_id       TEXT NOT NULL,
@@ -129,6 +180,28 @@ for (const [c, t] of [
  * строки: иначе чистка повторялась бы при каждом рестарте и стирала
  * уже честно отправленную веху — родитель получал бы её повторно.
  */
+/*
+ * Переезд на участников. Общий токен семьи превращается в строку
+ * участника с ролью parent — иначе все подключённые устройства
+ * получили бы 401 сразу после обновления. households.token_hash
+ * намеренно НЕ удаляется: колонка помечена UNIQUE NOT NULL, а SQLite
+ * не везде умеет DROP COLUMN, да и вреда от неё нет.
+ */
+if (db.pragma("user_version", { simple: true }) < 2) {
+  const rows = db.prepare("SELECT id, token_hash, created_at FROM households").all();
+  const ins = db.prepare(`
+    INSERT OR IGNORE INTO members (id, household_id, name, role, token_hash, created_at)
+    VALUES (?, ?, ?, 'parent', ?, ?)
+  `);
+  let n = 0;
+  for (const h of rows) {
+    const id = `m-${h.id.slice(0, 8)}-legacy`;
+    n += ins.run(id, h.id, "Прежний общий доступ", h.token_hash, h.created_at).changes;
+  }
+  db.pragma("user_version = 2");
+  if (n) console.log(`участников заведено из общих токенов: ${n}`);
+}
+
 if (db.pragma("user_version", { simple: true }) < 1) {
   const n = db.prepare("DELETE FROM notifications WHERE kind = 'dev'").run().changes;
   db.pragma("user_version = 1");
@@ -139,6 +212,48 @@ if (db.pragma("user_version", { simple: true }) < 1) {
 
 export const findHousehold = db.prepare(
   "SELECT * FROM households WHERE token_hash = ?"
+);
+
+/* ---------- участники и приглашения ---------- */
+
+export const findMemberByToken = db.prepare(
+  "SELECT * FROM members WHERE token_hash = ? AND revoked_at IS NULL"
+);
+
+export const insertMember = db.prepare(`
+  INSERT INTO members (id, household_id, name, role, token_hash, created_at)
+  VALUES (@id, @household_id, @name, @role, @token_hash, @created_at)
+`);
+
+export const listMembers = db.prepare(`
+  SELECT id, name, role, created_at, last_seen_at, revoked_at
+  FROM members WHERE household_id = ?
+  ORDER BY revoked_at IS NOT NULL, created_at
+`);
+
+export const touchMember = db.prepare(
+  "UPDATE members SET last_seen_at = ? WHERE id = ?"
+);
+
+export const revokeMember = db.prepare(
+  "UPDATE members SET revoked_at = ? WHERE id = ? AND household_id = ? AND revoked_at IS NULL"
+);
+
+export const countActiveParents = db.prepare(
+  "SELECT COUNT(*) AS n FROM members WHERE household_id = ? AND role = 'parent' AND revoked_at IS NULL"
+);
+
+export const insertInvite = db.prepare(`
+  INSERT INTO invites (code_hash, household_id, role, name, created_at, expires_at)
+  VALUES (@code_hash, @household_id, @role, @name, @created_at, @expires_at)
+`);
+
+export const findInvite = db.prepare(
+  "SELECT * FROM invites WHERE code_hash = ?"
+);
+
+export const useInvite = db.prepare(
+  "UPDATE invites SET used_at = ?, used_by = ? WHERE code_hash = ? AND used_at IS NULL"
 );
 
 /*
