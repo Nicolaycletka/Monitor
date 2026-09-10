@@ -16,10 +16,34 @@ android {
             ignoreAssetsPattern '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
+    /*
+     * Подпись release-сборки берётся из свойств проекта, которые
+     * передаёт сборочный конвейер (см. .github/workflows/android.yml).
+     * Ключ в репозиторий не кладётся — он лежит в секретах GitHub.
+     *
+     * Если свойств нет (локальная сборка без ключа), блок не создаётся
+     * вовсе и `assembleRelease` выдаст неподписанный APK. Это лучше,
+     * чем молча подписать чем попало: неподписанный Android просто не
+     * поставит, и ошибка будет видна сразу.
+     */
+    signingConfigs {
+        if (project.hasProperty('MONITOR_KEYSTORE')) {
+            release {
+                storeFile file(project.property('MONITOR_KEYSTORE'))
+                storePassword project.property('MONITOR_KEYSTORE_PASSWORD')
+                keyAlias project.property('MONITOR_KEY_ALIAS')
+                keyPassword project.property('MONITOR_KEY_PASSWORD')
+            }
+        }
+    }
+
     buildTypes {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            if (project.hasProperty('MONITOR_KEYSTORE')) {
+                signingConfig signingConfigs.release
+            }
         }
     }
 }
