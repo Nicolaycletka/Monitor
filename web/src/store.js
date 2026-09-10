@@ -9,6 +9,7 @@
 import { predictNext, hhmm, durShort } from "./sleep.js";
 import { feedNotify } from "./feed.js";
 import { nextMilestone } from "./milestones.js";
+import { noteServerBuild } from "./build-check.js";
 
 const DB_NAME = "baby-tracker";
 const STORE = "kv";
@@ -117,8 +118,23 @@ export async function saveState(state) {
 /*  Сеть                                                               */
 /* ------------------------------------------------------------------ */
 
-/** База приложения: "/" в корне, "/monitor/" в подкаталоге. */
-export const API = `${import.meta.env.BASE_URL}api`;
+/*
+ * База API.
+ *
+ * В вебе адрес относительный: приложение отдаётся тем же сервером, что
+ * и API, поэтому источник один и CORS не нужен.
+ *
+ * В автономном APK фронтенд лежит ВНУТРИ приложения и открывается с
+ * origin `https://localhost`, а сервер живёт на другом домене. Тогда
+ * при сборке задаётся `VITE_API_URL` — и наличие этой переменной
+ * служит признаком «сборка автономная» для всего остального кода
+ * (см. build-check.js): отдельный флаг заводить не нужно, а два флага
+ * рано или поздно разъедутся.
+ */
+export const API = import.meta.env.VITE_API_URL || `${import.meta.env.BASE_URL}api`;
+
+/** Собран ли клиент как автономное приложение (файлы внутри APK). */
+export const BUNDLED = Boolean(import.meta.env.VITE_API_URL);
 
 export async function createHousehold(name, birth, sex = null) {
   const res = await fetch(`${API}/household`, {
@@ -367,7 +383,14 @@ export async function syncOnce(state) {
     profileDirty = true;
   }
 
-  return { ...state, events, profile, profileDirty, rev: data.rev };
+  // сверка сборок: телефон мог остаться на бандле прошлой версии
+  noteServerBuild(data.build);
+
+  // роль приезжает с каждым ответом: её могли поменять или отозвать,
+  // пока телефон лежал в кармане, и узнать об этом надо тут же
+  const auth = data.member ? { ...state.auth, member: data.member } : state.auth;
+
+  return { ...state, auth, events, profile, profileDirty, rev: data.rev };
 }
 
 /* ------------------------------------------------------------------ */
@@ -378,14 +401,63 @@ export const uid = () =>
 
 export const liveEvents = (events) => events.filter((e) => !e.deleted);
 
-export function inviteLink(token) {
-  return `${location.origin}${import.meta.env.BASE_URL}#join=${token}`;
+/*
+ * Ссылка приглашения несёт ОДНОРАЗОВЫЙ КОД, а не токен доступа. Раньше
+ * в ней ехал настоящий токен семьи: кто угодно, кому она когда-либо
+ * попалась в переписке, получал полный доступ навсегда, а отозвать его
+ * можно было только сменив токен сразу всем. Код живёт сутки и сгорает
+ * при первом использовании.
+ *
+ * Старая форма `#join=` продолжает распознаваться: ссылки, разосланные
+ * до перехода, ещё лежат в чатах, и молча ломать их хуже, чем принять.
+ */
+export function inviteLink(code) {
+  return `${location.origin}${import.meta.env.BASE_URL}#invite=${code}`;
 }
 
 export function readJoinToken() {
-  const m = location.hash.match(/join=([A-Za-z0-9_-]+)/);
-  return m ? m[1] : null;
+  const m = location.hash.match(/(invite|join)=([A-Za-z0-9_-]+)/);
+  return m ? { kind: m[1] === "invite" ? "code" : "token", value: m[2] } : null;
 }
+
+/** Обмен кода приглашения на собственный токен участника. */
+export async function redeemInvite(code, name = "") {
+  const res = await fetch(`${API}/join`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ code, name }),
+  });
+  if (!res.ok) throw new Error("bad_invite");
+  return res.json(); // { token, householdId, member }
+}
+
+export async function createInvite(token, role, name = "") {
+  const res = await fetch(`${API}/invites`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+    body: JSON.stringify({ role, name }),
+  });
+  if (!res.ok) throw new Error("invite_failed");
+  return res.json();
+}
+
+export async function fetchMembers(token) {
+  const res = await fetch(`${API}/members`, { headers: { authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error("members_failed");
+  return (await res.json()).members;
+}
+
+export async function revokeMember(token, id) {
+  const res = await fetch(`${API}/members/${id}/revoke`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || "revoke_failed");
+  return true;
+}
+
+/** Роль решает сервер; здесь только то, что показывать. */
+export const isViewer = (state) => state?.auth?.member?.role === "viewer";
 
 /** Ссылка вида t.me/bot?start=<householdId> — сервер сам знает username бота. */
 export async function fetchTelegramLink(token) {

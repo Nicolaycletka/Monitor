@@ -1,5 +1,5 @@
 /* Кеш оболочки. Всё относительно scope, поэтому работает и в подкаталоге. */
-const CACHE = "bt-shell-v1";
+const CACHE = "bt-shell-v2";
 const SCOPE = self.registration.scope;              // .../monitor/
 const SCOPE_PATH = new URL(SCOPE).pathname;         // /monitor/
 
@@ -25,7 +25,21 @@ self.addEventListener("fetch", (e) => {
   if (url.pathname.startsWith(SCOPE_PATH + "api/")) return;
 
   if (e.request.mode === "navigate") {
-    e.respondWith(fetch(e.request).catch(() => caches.match(SCOPE)));
+    /*
+     * Сеть вперёд, кеш — только как офлайн-запасной вариант. И этот
+     * запасной вариант ОБНОВЛЯЕМ на каждой удачной навигации: иначе в
+     * кеше вечно лежит index.html с момента установки, ссылающийся на
+     * файлы сборки, которых на сервере давно нет, — и первый же поход
+     * в офлайн даёт пустой экран вместо приложения.
+     */
+    e.respondWith(
+      fetch(e.request)
+        .then((res) => {
+          if (res.ok) caches.open(CACHE).then((c) => c.put(SCOPE, res.clone()));
+          return res;
+        })
+        .catch(() => caches.match(SCOPE))
+    );
     return;
   }
 

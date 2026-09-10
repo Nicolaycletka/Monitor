@@ -9,7 +9,9 @@ import {
 import {
   loadState, saveState, createHousehold, syncOnce, uid, liveEvents,
   inviteLink, readJoinToken, API, relink, fetchTelegramLink, MANUAL_BIAS_LIMIT,
+  isViewer, redeemInvite, createInvite, fetchMembers, revokeMember,
 } from "./store.js";
+import { isUpdateAvailable } from "./build-check.js";
 import {
   IND, IND_KEYS, SEX_LABEL, SEX_GEN, DAYS_PER_MONTH, maxDays, inRange,
   zOf, valueAt, medianOf, pctText, measurements, gainRate, zTrend,
@@ -142,8 +144,20 @@ export default function App() {
 
   /* ---------- сохранение и синхронизация ---------- */
 
+  /*
+   * Единственный путь изменения состояния — поэтому режим «только
+   * просмотр» стоит ЗДЕСЬ, а не в каждом обработчике. Кнопки записи
+   * зрителю не показываются, но перекрыть надо и то, до чего он может
+   * дотянуться иначе (свайп, редактирование записи, настройки): иначе
+   * у него на телефоне копились бы записи, которые сервер молча
+   * отбрасывает, — призрачные данные, видимые только ему.
+   *
+   * Настоящая защита всё равно на сервере: здесь мы бережём зрителя
+   * от бессмысленных действий, а не семью от зрителя.
+   */
   const update = useCallback((fn) => {
     setState((prev) => {
+      if (isViewer(prev)) return prev;
       const next = typeof fn === "function" ? fn(prev) : fn;
       saveState(next);
       return next;
@@ -205,14 +219,18 @@ export default function App() {
    * а встречные приходят оттуда. Слияние по updatedAt, id у записей
    * уникальные, поэтому дублей не возникает.
    */
-  const doJoin = useCallback(async (token) => {
+  const doJoin = useCallback(async (join) => {
     const s = stateRef.current;
     setJoinBusy(true);
     setJoinErr(null);
     try {
+      // код приглашения меняем на СВОЙ токен; ссылки старого образца
+      // несут сам токен семьи и принимаются как есть
+      const got = join.kind === "code" ? await redeemInvite(join.value) : null;
+      const token = got ? got.token : join.value;
       const next = {
         ...s,
-        auth: { token },
+        auth: { token, member: got?.member ?? null },
         rev: 0,
         profileDirty: false,
         events: (s.events || []).map((e) => ({ ...e, dirty: true })),
@@ -387,10 +405,14 @@ export default function App() {
 
   if (!state) return <Splash text="Загружаю записи…" />;
 
+  const viewer = isViewer(state);
+
   // ссылка пришла на телефон, где приложение уже настроено
   if (
     joinTok &&
-    state.auth?.token !== joinTok &&
+    // код приглашения токеном не является, поэтому сравнивать с ним
+    // осмысленно только ссылку старого образца
+    !(joinTok.kind === "token" && state.auth?.token === joinTok.value) &&
     (state.profile || (state.events || []).length)
   ) {
     return (
@@ -439,6 +461,27 @@ export default function App() {
             <GearIcon />
           </button>
         </header>
+
+        {viewer && (
+          <div className="bt-card" style={{ padding: "10px 12px", opacity: 0.85 }}>
+            Режим просмотра: записи видны, но менять их нельзя.
+          </div>
+        )}
+
+        {/*
+          * Только для автономной сборки: в вебе расхождение версий
+          * лечится перезагрузкой и происходит само, показывать нечего.
+          * В APK файлы лежат внутри приложения, обновить их может лишь
+          * переустановка — поэтому здесь единственный сигнал о том, что
+          * приложение устарело. Без него устаревший клиент снаружи
+          * неотличим от исправного, а это уже стоило нам раунда отладки.
+          */}
+        {isUpdateAvailable() && (
+          <div className="bt-card" style={{ padding: "10px 12px" }}>
+            Вышла новая версия приложения. Записи синхронизируются как обычно,
+            но расчёты и тексты у вас старые — попросите прислать свежий APK.
+          </div>
+        )}
 
         {settingsOpen && (
           <SettingsSheet state={state} events={events} update={update} onClose={() => setSettingsOpen(false)} />
@@ -521,13 +564,15 @@ export default function App() {
                 </>
               )}
 
-              <button className={"big " + (active ? "wake" : "sleep")} onClick={toggleSleep}>
-                {active ? "Проснулся" : "Заснул"}
-              </button>
+              {!viewer && (
+                <button className={"big " + (active ? "wake" : "sleep")} onClick={toggleSleep}>
+                  {active ? "Проснулся" : "Заснул"}
+                </button>
+              )}
             </section>
             )}
 
-            {offset === 0 && (
+            {offset === 0 && !viewer && (
             <>
             <div className="quick">
               <button className={"qbtn" + (nursing ? " on" : "")}
@@ -585,9 +630,12 @@ export default function App() {
               </div>
             )}
 
-            <FeedNote events={events} profile={profile} now={tick}
-              feedsPerDay={state.feedsPerDay ?? null} pumpMl={state.pumpMl ?? null} />
             </>
+            )}
+
+            {offset === 0 && (
+              <FeedNote events={events} profile={profile} now={tick}
+                feedsPerDay={state.feedsPerDay ?? null} pumpMl={state.pumpMl ?? null} />
             )}
 
             <Kpis stats={dayStats(events, dayStart, nights)} title={offset === 0 ? "Сегодня" : null} />
@@ -1547,11 +1595,134 @@ function GearIcon() {
  * приложения, а не просто ПОКАЗЫВАЕТ его — здесь; расчёты и объяснения
  * остаются в «Неделе», рядом с тем, на что они влияют.
  */
-function SettingsSheet({ state, events, update, onClose }) {
+/**
+ * Кто имеет доступ к дневнику: список участников, приглашение и отзыв.
+ *
+ * Заменил прежний блок «Второй родитель», где просто показывалась
+ * ссылка с НАСТОЯЩИМ токеном семьи. У той схемы было три беды: отозвать
+ * доступ у одного человека нельзя — только сменить токен всем; сколько
+ * людей держат ссылку, неизвестно; и ссылка оставалась рабочим ключом
+ * в переписке навсегда. Здесь вместо неё одноразовый код на сутки.
+ *
+ * Список показывается и зрителю: видеть, кто ещё имеет доступ к дневнику
+ * ребёнка, — законный интерес любого участника. Приглашать и отзывать
+ * может только родитель, и это проверяет сервер, а не эта разметка.
+ */
+function Members({ state }) {
+  const token = state.auth.token;
+  const viewer = isViewer(state);
+  const [list, setList] = useState(null);
+  const [err, setErr] = useState(null);
+  const [invite, setInvite] = useState(null);
+  const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(false);
+
+  const reload = useCallback(() => {
+    fetchMembers(token).then(setList, () => setErr("Не удалось получить список."));
+  }, [token]);
+
+  useEffect(reload, [reload]);
+
+  const make = async (role) => {
+    setBusy(true);
+    setErr(null);
+    try {
+      const inv = await createInvite(token, role);
+      setInvite({ ...inv, link: inviteLink(inv.code) });
+      reload();
+    } catch {
+      setErr("Не удалось создать приглашение.");
+    }
+    setBusy(false);
+  };
+
+  const drop = async (m) => {
+    if (!confirm(`Отозвать доступ${m.name ? ` у «${m.name}»` : ""}? Это устройство перестанет открывать дневник.`)) return;
+    try {
+      await revokeMember(token, m.id);
+      reload();
+    } catch (e) {
+      setErr(e.message === "last_parent"
+        ? "Это последний участник с правом записи — сначала пригласите второго."
+        : "Не удалось отозвать доступ.");
+    }
+  };
+
+  const when = (ts) => (ts ? new Date(ts).toLocaleDateString("ru-RU") : "—");
+
+  return (
+    <div className="bt-card">
+      {err && <p className="hint" style={{ marginTop: 0 }}>{err}</p>}
+
+      {list === null ? (
+        <p className="hint" style={{ marginTop: 0 }}>Загружаю…</p>
+      ) : (
+        list.map((m) => (
+          <div key={m.id} className="row" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <div style={{ flex: 1, opacity: m.revokedAt ? 0.5 : 1 }}>
+              <div>
+                {m.name || (m.role === "parent" ? "Родитель" : "Просмотр")}
+                {m.me && " · это устройство"}
+              </div>
+              <div className="hint" style={{ margin: 0 }}>
+                {m.role === "parent" ? "может менять записи" : "только просмотр"}
+                {m.revokedAt
+                  ? ` · доступ отозван ${when(m.revokedAt)}`
+                  : ` · заходил ${when(m.lastSeenAt)}`}
+              </div>
+            </div>
+            {!viewer && !m.revokedAt && !m.me && (
+              <button className="nudge" onClick={() => drop(m)}>Отозвать</button>
+            )}
+          </div>
+        ))
+      )}
+
+      {!viewer && (
+        <>
+          <p className="hint">
+            Приглашение — одноразовый код, он действует сутки и сгорает после
+            первого подключения. «Только просмотр» подойдёт бабушке с дедушкой:
+            они увидят дневник целиком, но ничего не смогут изменить.
+          </p>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button className="sact ghost" disabled={busy} onClick={() => make("parent")}>
+              Пригласить родителя
+            </button>
+            <button className="sact ghost" disabled={busy} onClick={() => make("viewer")}>
+              Пригласить для просмотра
+            </button>
+          </div>
+        </>
+      )}
+
+      {invite && (
+        <>
+          <p className="hint">
+            {invite.role === "viewer" ? "Ссылка только для просмотра" : "Ссылка с правом записи"}
+            {" · действует до "}
+            {new Date(invite.expiresAt).toLocaleString("ru-RU", { dateStyle: "short", timeStyle: "short" })}
+          </p>
+          <input className="inp" readOnly value={invite.link} onFocus={(e) => e.target.select()} />
+          <button className="sact ghost full" onClick={async () => {
+            try {
+              if (navigator.share) await navigator.share({ url: invite.link, title: "Дневник сна" });
+              else await navigator.clipboard.writeText(invite.link);
+              setCopied(true);
+              setTimeout(() => setCopied(false), 2500);
+            } catch { /* пользователь отменил */ }
+          }}>
+            {copied ? "Скопировано" : "Поделиться ссылкой"}
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+function SettingsSheet({ state, events, update, onClose }) {
   const [tgLink, setTgLink] = useState(null);
   const [tgErr, setTgErr] = useState(false);
-  const link = inviteLink(state.auth.token);
 
   useEffect(() => {
     fetchTelegramLink(state.auth.token).then(
@@ -1580,25 +1751,8 @@ function SettingsSheet({ state, events, update, onClose }) {
       <div className="sheet settings-sheet" onClick={(e) => e.stopPropagation()}>
         <h3>Настройки</h3>
 
-        <div className="sec" style={{ marginTop: 0 }}>Второй родитель</div>
-        <div className="bt-card">
-          <p className="hint" style={{ marginTop: 0 }}>
-            Откройте эту ссылку на втором телефоне — записи будут общими.
-            Ссылка даёт полный доступ к дневнику, отправляйте только тому,
-            кому доверяете.
-          </p>
-          <input className="inp" readOnly value={link} onFocus={(e) => e.target.select()} />
-          <button className="sact ghost full" onClick={async () => {
-            try {
-              if (navigator.share) await navigator.share({ url: link, title: "Дневник сна" });
-              else await navigator.clipboard.writeText(link);
-              setCopied(true);
-              setTimeout(() => setCopied(false), 2500);
-            } catch { /* пользователь отменил */ }
-          }}>
-            {copied ? "Скопировано" : "Поделиться ссылкой"}
-          </button>
-        </div>
+        <div className="sec" style={{ marginTop: 0 }}>Кто имеет доступ</div>
+        <Members state={state} />
 
         <div className="sec">Уведомления в Telegram</div>
         <div className="bt-card">
@@ -2478,15 +2632,25 @@ function Onboarding({ onReady }) {
   const [sex, setSex] = useState(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
+  const [code, setCode] = useState("");
 
   useEffect(() => {
     if (!joinToken) return;
     (async () => {
       setBusy(true);
       try {
+        /*
+         * Код приглашения одноразовый и живёт сутки, поэтому «ссылка не
+         * подошла» здесь чаще всего значит не опечатку, а то, что ею уже
+         * воспользовались или она просрочена. Текст ошибки об этом и
+         * говорит — иначе человек будет тыкать в неё повторно.
+         */
+        const got = joinToken.kind === "code" ? await redeemInvite(joinToken.value) : null;
+        const token = got ? got.token : joinToken.value;
+
         const res = await fetch(`${API}/sync`, {
           method: "POST",
-          headers: { "content-type": "application/json", authorization: `Bearer ${joinToken}` },
+          headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
           body: JSON.stringify({ since: 0, events: [] }),
         });
         if (!res.ok) throw new Error("Ссылка не подошла. Попросите прислать новую.");
@@ -2495,13 +2659,15 @@ function Onboarding({ onReady }) {
         onReady({
           profile: data.profile,
           events: data.events.map((e) => ({ ...e, dirty: false })),
-          auth: { token: joinToken },
+          auth: { token, member: data.member ?? got?.member ?? null },
           rev: data.rev,
           bias: 0,
           profileDirty: false,
         });
       } catch (e) {
-        setErr(e.message);
+        setErr(e.message === "bad_invite"
+          ? "Приглашение уже использовано или просрочено. Попросите новое."
+          : e.message);
         setBusy(false);
       }
     })();
@@ -2510,6 +2676,45 @@ function Onboarding({ onReady }) {
   if (joinToken && !err) return <Splash text="Подключаюсь к дневнику…" />;
 
   const ok = name.trim() && date && sex && !busy;
+
+  /*
+   * Подключение по коду, набранному руками.
+   *
+   * Ссылка приглашения ведёт на сайт, и в обёртке Capacitor она откроется
+   * в браузере, а не в приложении: перехват ссылок требует настроенного
+   * assetlinks.json и подписи APK, то есть работает не всегда и ломается
+   * молча. Ввод кода работает всегда и везде — в том числе когда
+   * мессенджер испортил ссылку или её переслали текстом.
+   *
+   * Принимаем и голый код, и целую ссылку: человек скорее вставит то,
+   * что у него в буфере, чем станет выкусывать часть после решётки.
+   */
+  const useCode = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      const clean = code.match(/(?:invite|join)=([A-Za-z0-9_-]+)/)?.[1] || code;
+      const got = await redeemInvite(clean);
+      const res = await fetch(`${API}/sync`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${got.token}` },
+        body: JSON.stringify({ since: 0, events: [] }),
+      });
+      if (!res.ok) throw new Error("sync_failed");
+      const data = await res.json();
+      onReady({
+        profile: data.profile,
+        events: data.events.map((e) => ({ ...e, dirty: false })),
+        auth: { token: got.token, member: data.member ?? got.member ?? null },
+        rev: data.rev,
+        bias: 0,
+        profileDirty: false,
+      });
+    } catch {
+      setErr("Код не подошёл: он одноразовый и действует сутки. Попросите новый.");
+      setBusy(false);
+    }
+  };
 
   const submit = async () => {
     setBusy(true);
@@ -2562,9 +2767,29 @@ function Onboarding({ onReady }) {
             {busy ? "Создаю…" : "Продолжить"}
           </button>
         </div>
+        <div className="sec">Уже есть приглашение</div>
+        <div className="bt-card">
+          <p className="hint" style={{ marginTop: 0 }}>
+            Если вам прислали ссылку, но она открылась не в приложении, введите
+            код из неё — это часть после решётки.
+          </p>
+          <input
+            className="inp"
+            value={code}
+            onChange={(e) => setCode(e.target.value.trim())}
+            placeholder="Код приглашения"
+            autoCapitalize="off"
+            autoCorrect="off"
+            spellCheck={false}
+          />
+          <button className="sact ghost full" disabled={!code || busy} onClick={useCode}>
+            {busy ? "Подключаюсь…" : "Подключиться по коду"}
+          </button>
+        </div>
+
         <p className="hint">
           Записи хранятся на вашем сервере и на телефоне. Второй родитель
-          подключается по ссылке из раздела «Неделя».
+          подключается по приглашению из настроек.
         </p>
       </div>
     </div>

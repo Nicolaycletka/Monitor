@@ -1,0 +1,19 @@
+{
+  "name": "baby-tracker-mobile",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Обёртка Capacitor: то же веб-приложение, но ставится как обычный APK",
+  "scripts": {
+    "android:add": "cap add android",
+    "android:build": "cd web && BASE_PATH=/ VITE_API_URL=https://burmalda.host/monitor/api npm run build && cd .. && cap sync android",
+    "android:open": "cap open android",
+    "android:apk": "cd android && ./gradlew assembleDebug"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^6.2.0"
+  },
+  "dependencies": {
+    "@capacitor/android": "^6.2.0",
+    "@capacitor/core": "^6.2.0"
+  }
+}

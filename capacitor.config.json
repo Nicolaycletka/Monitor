@@ -1,0 +1,11 @@
+{
+  "appId": "host.burmalda.monitor",
+  "appName": "Дневник сна",
+  "webDir": "web/dist",
+  "android": {
+    "allowMixedContent": false
+  },
+  "server": {
+    "androidScheme": "https"
+  }
+}
