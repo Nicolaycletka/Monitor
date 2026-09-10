@@ -1214,6 +1214,26 @@ Huckleberry, убрана Taking Cara Babies. Смысл сравнения — 
 часть внутри `predictNext` это `selfCheck`/`measureBias`, а не перебор
 источников. Правка сделана ради простоты, а не производительности.
 
+## Зависимость объявляется там, где используется
+
+`@capacitor/local-notifications` сначала был поставлен только в корневой
+`package.json` — и образ Docker перестал собираться:
+
+    process "/bin/sh -c npm run build" did not complete successfully
+
+Причина в том, что Dockerfile копирует ТОЛЬКО `web/` и `server/`,
+корневой `package.json` в образ не попадает вовсе. Локально всё
+собиралось, потому что Vite находил пакет в `node_modules` родительской
+папки — классический случай, когда локальная сборка врёт.
+
+Правило простое: пакет, который импортируется из `web/src`, объявляется
+в `web/package.json`, даже если он же нужен Capacitor снаружи.
+
+Заодно `jsdom` и `fake-indexeddb` переехали в `devDependencies` — они
+нужны только дымовым тестам, в образе им делать нечего. `jsdom`
+закреплён на 24: на 30 тесты падают с «request for
+'./fallback/encoding.js' is from a module not been linked».
+
 ## Уведомления на самом телефоне
 
 `web/src/notify-local.js` + `@capacitor/local-notifications`. Приложение
