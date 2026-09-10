@@ -12,6 +12,7 @@ import {
   isViewer, redeemInvite, createInvite, fetchMembers, revokeMember,
 } from "./store.js";
 import { isUpdateAvailable } from "./build-check.js";
+import * as localNotify from "./notify-local.js";
 import {
   IND, IND_KEYS, SEX_LABEL, SEX_GEN, DAYS_PER_MONTH, maxDays, inRange,
   zOf, valueAt, medianOf, pctText, measurements, gainRate, zTrend,
@@ -75,6 +76,9 @@ const FEED_LABEL = {
   formula: "Смесь", ebm: "Сцеженное молоко", solid: "Прикорм", water: "Вода",
 };
 
+/** Шаг подстройки объёма — цена деления на большинстве бутылочек. */
+const ML_STEP = 10;
+
 /** Что предлагается по кнопке «Бутылочка». */
 const BOTTLE_KINDS = [["formula", "Смесь"], ["ebm", "Молоко"], ["water", "Вода"]];
 const DIAPER_LABEL = { wet: "Мокрый", dirty: "Стул", mixed: "Мокрый и стул" };
@@ -124,6 +128,12 @@ export default function App() {
   const [tick, setTick] = useState(Date.now());
   const [toast, setToast] = useState(null);
   const [quick, setQuick] = useState(null);
+  /*
+   * Только что записанное кормление: { id, ml }. Держится ради полоски
+   * подстройки под кнопками — она позволяет поправить объём, не открывая
+   * редактор записи. Сбрасывается по «Готово» и при уходе с вкладки.
+   */
+  const [justFed, setJustFed] = useState(null);
   const [bottle, setBottle] = useState("formula");
   const [editing, setEditing] = useState(null);
   const [offset, setOffset] = useState(0);
@@ -260,7 +270,14 @@ export default function App() {
 
   /* ---------- действия ---------- */
 
-  const events = useMemo(() => liveEvents(state?.events || []), [state]);
+  /*
+   * Ключ — именно `state.events`, а не весь `state`. Раньше здесь стоял
+   * `[state]`, и массив пересоздавался при ЛЮБОМ изменении состояния:
+   * правке поправки, ответе синка, смене настройки. Новая ссылка на
+   * массив рушила мемоизацию всего, что считается от событий, — в первую
+   * очередь прогноза, а он самый дорогой расчёт в приложении.
+   */
+  const events = useMemo(() => liveEvents(state?.events || []), [state?.events]);
 
   /*
    * Какие записи относятся к ночи с учётом склейки. Считается один раз
@@ -276,6 +293,60 @@ export default function App() {
     [events, state?.profile?.birth, tick]
   );
   const active = events.find((e) => e.type === "sleep" && !e.end);
+
+  /*
+   * Прогноз — самый дорогой расчёт приложения: замер на дневнике из
+   * 203 событий дал 16.8 мс против 0.1 мс у всего остального вместе
+   * взятого. Цена заложена в самом алгоритме (PICK_TAIL × глубина²
+   * подгонок, см. sleep.js), и уменьшать её там нельзя без потери
+   * качества — это уже проверялось замером.
+   *
+   * Поэтому его не удешевляют, а перестают звать зря. Раньше вызов
+   * стоял прямо в теле рендера: переключение вкладки, добавление
+   * кормления, любой ввод — и 16.8 мс заново, на телефоне заметно
+   * больше.
+   *
+   * Стоять этот хук обязан ЗДЕСЬ, выше ранних `return` для загрузки и
+   * первого запуска. Хук после условного выхода вызывается не на
+   * каждом рендере, и React падает с «Rendered more hooks than during
+   * the previous render» — сборка такого не ловит, приложение
+   * показывает пустой фон.
+   *
+   * Время огрубляется до минуты намеренно: тик идёт каждые 15 секунд,
+   * и без округления прогноз считался бы четырежды в минуту без
+   * пользы — границы окна показываются с точностью до минуты.
+   */
+  const winMinute = Math.floor(tick / 60000);
+  const win = useMemo(
+    () =>
+      active || !state?.profile?.birth
+        ? null
+        : predictNext(events, state.profile.birth, winMinute * 60000, state.bias || 0),
+    [active, events, state?.profile?.birth, winMinute, state?.bias]
+  );
+
+  /*
+   * Локальное уведомление о начале окна сна.
+   *
+   * Планируется от того же прогноза, что показан на экране, — отдельного
+   * расчёта нет, иначе они разъезжались бы. Пока ребёнок спит, окна нет,
+   * и запланированное снимается: показывать «пора укладываться» спящему
+   * — худшее, что приложение может сделать.
+   *
+   * В вебе весь модуль — пустышка, и это его забота, а не наша: здесь
+   * нет ни проверок платформы, ни try/catch вокруг вызовов.
+   */
+  useEffect(() => {
+    if (active || !win?.from) {
+      localNotify.cancelWindow();
+      return;
+    }
+    localNotify.scheduleWindow(
+      win.from,
+      `${state?.profile?.name || "Ребёнок"} бодрствует достаточно — можно укладывать`
+    );
+  }, [active, win?.from, state?.profile?.name]);
+
 
   const putEvent = (ev) =>
     update((s) => {
@@ -301,6 +372,24 @@ export default function App() {
     putEvent(ev);
     flash(eventTitle(ev, nights), () => putEvent({ ...ev, deleted: true }));
     setQuick(null);
+    setTimeout(runSync, 800);
+    return ev.id; // чтобы объём можно было поправить сразу, не открывая редактор
+  };
+
+  /*
+   * Шаг подстройки. 10 мл — цена деления на большинстве бутылочек, то
+   * есть меньший шаг всё равно не соответствовал бы тому, что реально
+   * можно разглядеть.
+   */
+  const adjustJustFed = (d) => {
+    setJustFed((cur) => {
+      if (!cur) return cur;
+      const ml = Math.max(ML_STEP, cur.ml + d);
+      const ev = stateRef.current?.events?.find((e) => e.id === cur.id);
+      // записи может не быть, если её успели отменить через «Отменить»
+      if (ev) putEvent({ ...ev, meta: { ...(ev.meta || {}), ml } });
+      return { ...cur, ml };
+    });
     setTimeout(runSync, 800);
   };
 
@@ -434,9 +523,8 @@ export default function App() {
   }
 
   const { profile, bias } = state;
-  // predictNext сам измеряет личную поправку по хвосту истории
-  // (~3 мс на 90 днях) и применяет её — отдельно её считать не нужно
-  const win = active ? null : predictNext(events, profile.birth, tick, bias || 0);
+
+
   const napRef = active ? typicalNap(events, active.start, 10, profile.birth, active) : null;
   const todayStart = startOfDay(tick);
   // общие и для живого состояния, и для списка записей — раньше это
@@ -574,6 +662,34 @@ export default function App() {
 
             {offset === 0 && !viewer && (
             <>
+            {justFed && (
+              <div className="bt-card" style={{ padding: "10px 12px" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <button
+                    className="nudge"
+                    aria-label="Меньше на 10 мл"
+                    disabled={justFed.ml <= ML_STEP}
+                    onClick={() => adjustJustFed(-ML_STEP)}
+                  >−{ML_STEP}</button>
+
+                  <div style={{ flex: 1, textAlign: "center" }}>
+                    <span className="bt-num" style={{ fontSize: "1.3em" }}>{justFed.ml}</span> мл
+                  </div>
+
+                  <button
+                    className="nudge"
+                    aria-label="Больше на 10 мл"
+                    onClick={() => adjustJustFed(ML_STEP)}
+                  >+{ML_STEP}</button>
+
+                  <button className="sact ghost" onClick={() => setJustFed(null)}>Готово</button>
+                </div>
+                <p className="hint" style={{ marginBottom: 0 }}>
+                  Записано. Поправьте объём, если бутылочку допили не всю.
+                </p>
+              </div>
+            )}
+
             <div className="quick">
               <button className={"qbtn" + (nursing ? " on" : "")}
                 onClick={nursing ? stopNursing : startNursing}>
@@ -608,7 +724,15 @@ export default function App() {
                 <div className="chips">
                   {[20, 30, 40, 60, 80, 100, 120, 150, 180].map((ml) => (
                     <button key={ml} className="chip" onClick={() => {
-                      logEvent("feed", { kind: bottle, ml });
+                      /*
+                       * Запись создаётся СРАЗУ, одним нажатием, и только
+                       * потом предлагается подстройка. Наоборот — сначала
+                       * набрать точный объём, потом подтвердить — хуже:
+                       * кормление отмечают с ребёнком на руках, и запись,
+                       * потерянная из-за незавершённого ввода, дороже
+                       * неточных двадцати миллилитров.
+                       */
+                      setJustFed({ id: logEvent("feed", { kind: bottle, ml }), ml });
                       setQuick(null);
                     }}>{ml} мл</button>
                   ))}
@@ -1450,8 +1574,7 @@ function HowItWorks({ state, events }) {
         </p>
         <p className="hint">
           Чужие таблицы взяты как опубликованы, без усреднения и правок.{" "}
-          {TABLES.cara.label}: {TABLES.cara.note}. {TABLES.huck.label}:{" "}
-          {TABLES.huck.note}. Своя — {TABLES.app.note}.
+          {TABLES.huck.label}: {TABLES.huck.note}. Своя — {TABLES.app.note}.
         </p>
         <p className="hint">
           Поправка «позже» берётся не целиком и тем слабее, чем чаще
@@ -1720,6 +1843,57 @@ function Members({ state }) {
   );
 }
 
+/**
+ * Разрешение на локальные уведомления.
+ *
+ * Спрашивается по нажатию, а не само при первом запуске. Системный
+ * запрос, вылетевший без объяснения, чаще всего получает отказ — а
+ * отказ на Android повторно уже не спросишь, только через настройки
+ * системы. Поэтому сначала текст, потом кнопка.
+ *
+ * В вебе плагина нет, и раздел просто не показывается: объяснять
+ * отсутствие того, чего человек не просил, незачем.
+ */
+function LocalNotifySetting() {
+  const [state, setState] = useState("loading"); // loading | absent | granted | denied
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      if (!(await localNotify.available())) { alive && setState("absent"); return; }
+      const ok = await localNotify.permissionGranted();
+      alive && setState(ok ? "granted" : "denied");
+    })();
+    return () => { alive = false; };
+  }, []);
+
+  if (state === "loading" || state === "absent") return null;
+
+  return (
+    <div className="bt-card">
+      {state === "granted" ? (
+        <p className="hint" style={{ marginTop: 0, marginBottom: 0 }}>
+          Уведомление о начале окна сна придёт на этот телефон. Оно считается
+          прямо здесь, поэтому работает и без интернета — в отличие от
+          сообщений в Telegram, которые шлёт сервер.
+        </p>
+      ) : (
+        <>
+          <p className="hint" style={{ marginTop: 0 }}>
+            Приложение может само напомнить, когда подойдёт окно сна — без
+            Telegram и без интернета, расчёт идёт на телефоне.
+          </p>
+          <button className="sact ghost full" onClick={async () => {
+            setState(await localNotify.requestPermission() ? "granted" : "denied");
+          }}>
+            Разрешить уведомления
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
 function SettingsSheet({ state, events, update, onClose }) {
   const [tgLink, setTgLink] = useState(null);
   const [tgErr, setTgErr] = useState(false);
@@ -1750,6 +1924,9 @@ function SettingsSheet({ state, events, update, onClose }) {
     <div className="sheet-bg" onClick={onClose}>
       <div className="sheet settings-sheet" onClick={(e) => e.stopPropagation()}>
         <h3>Настройки</h3>
+
+        <div className="sec" style={{ marginTop: 0 }}>Уведомления на телефоне</div>
+        <LocalNotifySetting />
 
         <div className="sec" style={{ marginTop: 0 }}>Кто имеет доступ</div>
         <Members state={state} />
@@ -1945,7 +2122,7 @@ function QualityCard({ state, events }) {
         ))}
       </div>
       <p className="hint">
-        Сейчас работает <b>{sourceLabel(pick.key)}</b> — тот из четырёх
+        Сейчас работает <b>{sourceLabel(pick.key)}</b> — тот из трёх
         источников, что промахивался меньше на последних {scores[0].n} снах.
         Смотрите не на абсолютную долю попаданий, а на отрыв выбранного
         от остальных. Подробности — в настройках ⚙️.
