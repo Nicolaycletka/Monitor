@@ -27,9 +27,14 @@
             android:grantUriPermissions="true">
             <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths" />
         </provider>
+
     </application>
 
     <!-- Permissions -->
 
     <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Android 13+ требует явного разрешения на показ уведомлений.
+         Запрашивается в приложении по кнопке, а не молча при запуске. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 </manifest>

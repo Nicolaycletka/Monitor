@@ -13,6 +13,7 @@ import {
 } from "./store.js";
 import { isUpdateAvailable } from "./build-check.js";
 import * as localNotify from "./notify-local.js";
+import * as sleepNote from "./sleep-notification.js";
 import {
   IND, IND_KEYS, SEX_LABEL, SEX_GEN, DAYS_PER_MONTH, maxDays, inRange,
   zOf, valueAt, medianOf, pctText, measurements, gainRate, zTrend,
@@ -361,6 +362,85 @@ export default function App() {
       clearTimeout(id);
     };
   }, [active, events, birth, winMinute, state?.bias]);
+
+  /*
+   * Постоянное уведомление с кнопкой отметки сна.
+   *
+   * Держится в том же состоянии, что экран: если ребёнок спит — кнопка
+   * «Проснулся», если нет — «Заснул» и текст окна. Рассинхрон здесь
+   * опаснее отсутствия уведомления вовсе: кнопка, которая отмечает не
+   * то, что показывает, испортит дневник молча.
+   *
+   * Зрителю не показываем: он всё равно ничего не пишет, а кнопка,
+   * которая ничего не делает, хуже её отсутствия.
+   *
+   * Работает только в автономном APK с нативным плагином; в вебе весь
+   * модуль — пустышка, проверок платформы здесь намеренно нет.
+   */
+  useEffect(() => {
+    if (isViewer(state) || !state?.auth?.token) {
+      sleepNote.hideSleepNotification();
+      return;
+    }
+    const openSleep = active || null;
+    const text = openSleep
+      ? `Спит с ${hhmm(openSleep.start)}`
+      : win?.from
+        ? `Окно сна ${hhmm(win.from)}–${hhmm(win.to)}`
+        : "Окно сна пока не рассчитано";
+
+    sleepNote.showSleepNotification({ asleep: Boolean(openSleep), body: text });
+  }, [active, win?.from, win?.to, state?.auth?.token]);
+
+  /*
+   * Применение отметки, сделанной кнопкой в уведомлении.
+   *
+   * Кнопка только запускает приложение с пометкой; сама запись
+   * создаётся здесь — теми же `putEvent` и `runSync`, что и кнопка на
+   * экране. Отдельной ветки записи не существует, и держать две
+   * согласованными не нужно.
+   *
+   * Время берётся из пометки, а не текущее: между нажатием и
+   * готовностью приложения проходит секунда-другая.
+   *
+   * Проверяем при запуске и при каждом возврате на передний план —
+   * приложение могло быть уже открыто, тогда холодного старта не
+   * будет вовсе. Плагин гасит пометку при выдаче, поэтому лишние
+   * проверки безвредны.
+   */
+  useEffect(() => {
+    if (!state?.auth?.token || isViewer(state)) return;
+
+    let alive = true;
+    const apply = async () => {
+      const p = await sleepNote.consumePendingAction();
+      if (!alive || !p) return;
+      const st = stateRef.current;
+      const open = liveEvents(st?.events || []).find((e) => e.type === "sleep" && !e.end);
+
+      if (p.action === "wake_up") {
+        // закрывать нечего — приложение уже знает, что ребёнок не спит
+        if (!open) return;
+        putEvent({ ...open, end: p.at });
+        flash(`Проснулся · ${dur(p.at - open.start)}`, () => putEvent(open));
+      } else if (p.action === "fall_asleep") {
+        // сон уже открыт: повторная отметка создала бы второй
+        if (open) return;
+        const ev = { id: uid(), type: "sleep", start: p.at, end: null };
+        putEvent(ev);
+        flash("Заснул", () => putEvent({ ...ev, deleted: true }));
+      }
+      setTimeout(runSync, 800);
+    };
+
+    apply();
+    const onVisible = () => { if (document.visibilityState === "visible") apply(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      alive = false;
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [state?.auth?.token]);
 
   /*
    * Локальное уведомление о начале окна сна.
