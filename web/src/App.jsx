@@ -317,13 +317,50 @@ export default function App() {
    * пользы — границы окна показываются с точностью до минуты.
    */
   const winMinute = Math.floor(tick / 60000);
-  const win = useMemo(
-    () =>
-      active || !state?.profile?.birth
-        ? null
-        : predictNext(events, state.profile.birth, winMinute * 60000, state.bias || 0),
-    [active, events, state?.profile?.birth, winMinute, state?.bias]
-  );
+
+  /*
+   * Прогноз считается ПОСЛЕ отрисовки, а не во время неё.
+   *
+   * Добавление сна — честный промах всех кешей, и пересчёт занимает
+   * около секунды на дневнике из 81 сна (замер; было восемь секунд до
+   * починки ключей и кеша личной прямой). Синхронный расчёт в теле
+   * рендера означал, что этот час миллисекунд родитель ждёт, глядя на
+   * замерший экран, — нажатие «Заснул» не отзывалось вообще.
+   *
+   * Теперь запись попадает в дневник и на экран немедленно, а окно
+   * пересчитывается следом. Прежнее значение при этом НЕ стирается:
+   * показывать пустоту вместо окна, пока считается новое, хуже, чем
+   * показывать слегка устаревшее. Единственное, что сбрасывается
+   * сразу, — окно во время сна, потому что оно бессмысленно.
+   *
+   * Задержка перед стартом намеренная. Нулевая тоже убрала бы расчёт
+   * из рендера, но он запустился бы вплотную к нему и успел бы
+   * подморозить анимацию нажатия и перерисовку списка. Четверть
+   * секунды хватает, чтобы интерфейс закончил работу.
+   */
+  const [win, setWin] = useState(null);
+  const [winBusy, setWinBusy] = useState(false);
+  const birth = state?.profile?.birth;
+
+  useEffect(() => {
+    if (active || !birth) {
+      setWin(null);
+      setWinBusy(false);
+      return;
+    }
+    let alive = true;
+    setWinBusy(true);
+    const id = setTimeout(() => {
+      const w = predictNext(events, birth, winMinute * 60000, state?.bias || 0);
+      if (!alive) return;
+      setWin(w);
+      setWinBusy(false);
+    }, 250);
+    return () => {
+      alive = false;
+      clearTimeout(id);
+    };
+  }, [active, events, birth, winMinute, state?.bias]);
 
   /*
    * Локальное уведомление о начале окна сна.

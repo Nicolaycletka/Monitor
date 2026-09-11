@@ -60,14 +60,36 @@ const STATIC_DIR = process.env.STATIC_DIR || join(__dirname, "..", "web", "dist"
  * Читаем один раз при старте: контейнер пересобирается вместе с
  * фронтендом, так что в живом процессе это значение поменяться не может.
  */
-const BUILD = (() => {
+const { BUILD, VERSION } = (() => {
   try {
     const html = readFileSync(join(STATIC_DIR, "index.html"), "utf8");
-    return html.match(/assets\/([A-Za-z0-9._-]+\.js)/)?.[1] || null;
+    return {
+      BUILD: html.match(/assets\/([A-Za-z0-9._-]+\.js)/)?.[1] || null,
+      VERSION: html.match(/name="app-version" content="([^"]+)"/)?.[1] || null,
+    };
   } catch {
-    return null; // дев-режим: фронтенд отдаёт vite, dist ещё нет
+    return { BUILD: null, VERSION: null }; // дев-режим: фронтенд отдаёт vite, dist ещё нет
   }
 })();
+
+/*
+ * Полей два, потому что признак свежести у веба и у APK разный.
+ *
+ * BUILD — имя собранного файла с хешем содержимого. Годится для веба:
+ * там сервер отдаёт ровно тот файл, который у клиента, и любое
+ * изменение кода меняет хеш.
+ *
+ * VERSION — версия из web/package.json, попадающая в разметку мета-тегом.
+ * Только она годится для автономного APK: он собирается с другими
+ * BASE_PATH и VITE_API_URL, поэтому его хеш ОТЛИЧАЕТСЯ ОТ СЕРВЕРНОГО
+ * ВСЕГДА, даже когда обе сборки из одного коммита. Сравнение хешей там
+ * давало вечную плашку «вышла новая версия» на самой свежей сборке.
+ *
+ * Цена: чтобы APK узнал о новой версии, версию надо поднять в
+ * web/package.json. Забыли поднять — плашка не появится. Это лучше, чем
+ * горящая всегда: постоянное предупреждение перестают замечать, и оно
+ * не сработает тогда, когда действительно понадобится.
+ */
 
 const app = express();
 app.disable("x-powered-by");
@@ -452,6 +474,7 @@ r.post("/api/sync", throttle, auth, (req, res) => {
     },
     serverTime: Date.now(),
     build: BUILD,
+    version: VERSION,
     member: memberInfo(req.member),
   });
 });

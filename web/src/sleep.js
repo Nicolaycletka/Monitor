@@ -580,9 +580,47 @@ function progressAt(sleeps, prev) {
  * четверти. Полностью таблица не отбрасывается никогда: две недели
  * дневника это всё ещё две недели.
  */
+/*
+ * Запоминание личной прямой.
+ *
+ * personalWindow — чистая функция от (выборка снов, birth, now), но
+ * стоит 8.3 мс из 9.5 мс всего predictWindow, то есть почти всё время
+ * прогноза. А зовут её лавинообразно: measureBias делает
+ * VALIDATION_DEPTH прогнозов по префиксам истории, sourceScores
+ * повторяет это для PICK_TAIL точек и каждого источника. Одни и те же
+ * пары (префикс, момент) при этом встречаются многократно — префиксы
+ * берутся из ОДНОГО отсортированного массива, и наборы перекрываются.
+ *
+ * Поэтому здесь именно кеш на много записей, а не на одну, как у
+ * остальных функций модуля: смысл как раз в попаданиях ВНУТРИ одного
+ * расчёта.
+ *
+ * Ключ однозначно определяет префикс: длина плюс границы (первый старт
+ * и последний конец) при том, что все префиксы режутся из одного
+ * массива. `now` входит в ключ, потому что от него зависит отбор точек
+ * (FIT_DAYS) — без него кеш возвращал бы чужой ответ.
+ *
+ * Размер ограничен: это кеш одного расчёта, а не постоянное хранилище,
+ * и расти ему незачем. При переполнении просто очищается — терять
+ * нечего, всё пересчитывается.
+ */
+const fitCache = new Map();
+const FIT_CACHE_MAX = 4000;
+
 export function personalWindow(events, birth, now = Date.now()) {
   if (!Number.isFinite(birth)) return null;
   const sleeps = mergeSleeps(healthySleeps(events), birth).sort((a, b) => a.start - b.start);
+
+  const first = sleeps[0], last = sleeps[sleeps.length - 1];
+  const key = `${sleeps.length}:${first?.start}:${last?.end}:${birth}:${now}`;
+  if (fitCache.has(key)) return fitCache.get(key);
+  const value = computePersonalWindow(sleeps, birth, now);
+  if (fitCache.size >= FIT_CACHE_MAX) fitCache.clear();
+  fitCache.set(key, value);
+  return value;
+}
+
+function computePersonalWindow(sleeps, birth, now) {
   const pts = [];
   for (let i = 1; i < sleeps.length; i++) {
     const cur = sleeps[i], prev = sleeps[i - 1];
@@ -982,12 +1020,72 @@ const stats = (xs) => {
  */
 export const VALIDATION_DEPTH = 17;
 
+/*
+ * Кеш поправки — тот же приём, что у sourceScores и selfCheck, но здесь
+ * он важнее всего: замер на реальном дневнике (322 записи, 81 сон) дал
+ * measureBias 79.7 мс из 85 мс всего прогноза. Всё остальное вместе —
+ * доли миллисекунды.
+ *
+ * Цена заложена в самом методе: walk-forward по последним
+ * VALIDATION_DEPTH снам, и для каждого — свой predictWindow по всем
+ * предыдущим. Около 289 вложенных прогнозов за вызов. Уменьшать глубину
+ * нельзя, это прямо ухудшает поправку.
+ *
+ * Ключ строится ПО СНАМ, а не по всему дневнику, и это главное. Поправка
+ * не зависит ни от кормлений, ни от веса, ни от замеров роста — только
+ * от снов, меток засыпания и периодов болезни. Поэтому добавление
+ * кормления теперь попадает в кеш и не стоит ничего, хотя раньше
+ * пересчитывало все 80 мс. Именно это ощущалось как «тормозит даже при
+ * добавлении еды».
+ *
+ * В ключ входит вся выборка, а не только хвост: measureBias для каждой
+ * точки строит прогноз по ВСЕМ предыдущим снам, так что изменение
+ * старой записи меняет результат.
+ */
+let biasCache = { key: null, value: null };
+
+/*
+ * Подпись ВЫБОРКИ СНОВ — общий ключ для всех трёх кешей модуля.
+ *
+ * БЫЛ БАГ, и дорогой. Ключи строились по последней записи дневника:
+ * `${events.length}:${last?.id}:${last?.end}`. Но последняя запись
+ * после кормления — это кормление, после взвешивания — вес. Любая
+ * запись любого типа сбрасывала кеши расчётов, которые от неё вообще
+ * не зависят.
+ *
+ * Замер на реальном дневнике (81 сон, 169 кормлений, 65 взвешиваний):
+ * добавление ОДНОГО кормления стоило sourceScores 7.2 с и selfCheck
+ * 0.9 с. Восемь секунд на отметку бутылочки — ровно то, что ощущалось
+ * как «тормозит даже при добавлении еды», и тем сильнее, чем больше
+ * накоплено снов.
+ *
+ * Все три функции оценивают качество прогноза сна. Их вход — сны,
+ * метки засыпания и периоды болезни, и ничего больше. Поэтому подпись
+ * строится по склеенной выборке снов целиком: walk-forward для каждой
+ * точки строит прогноз по ВСЕМ предыдущим снам, так что правка старой
+ * записи меняет результат и обязана менять ключ.
+ *
+ * Стоимость самой подписи — доли миллисекунды против секунд расчёта.
+ */
+function sleepsKey(events, birth) {
+  const sleeps = mergeSleeps(healthySleeps(events), birth).sort((a, b) => a.start - b.start);
+  let acc = `${sleeps.length}:${birth}`;
+  for (const s of sleeps) acc += `|${s.start},${s.end},${settleOf(s) || ""}`;
+  return { key: acc, sleeps };
+}
+
 export function measureBias(events, birth) {
   // дни болезни в обучение не идут (см. illnessPeriods), фрагменты
   // склеены (см. mergeSleeps): иначе пробуждение внутри ночи давало бы
   // второе наблюдение с окном бодрствования в двадцать минут
-  const sleeps = mergeSleeps(healthySleeps(events), birth)
-    .sort((a, b) => a.start - b.start);
+  const { key, sleeps } = sleepsKey(events, birth);
+  if (biasCache.key === key) return biasCache.value;
+  const value = computeBias(sleeps, birth);
+  biasCache = { key, value };
+  return value;
+}
+
+function computeBias(sleeps, birth) {
   const diffs = [];
   const rawDiffs = [];
   // те же наблюдения, разложенные по половинам дня: одна общая поправка
@@ -1211,8 +1309,7 @@ export const SELFCHECK_MARGIN = 5;
 let checkCache = { key: null, value: null };
 
 export function selfCheck(events, birth, now = Date.now()) {
-  const last = events[events.length - 1];
-  const key = `${events.length}:${last?.id}:${last?.end}:${birth}`;
+  const { key } = sleepsKey(events, birth); // см. sleepsKey: кормления сюда не входят
   if (checkCache.key === key) return checkCache.value;
 
   const value = computeSelfCheck(events, birth, now);
@@ -1369,8 +1466,7 @@ export function windowBy(source, events, birth, now, manual = 0) {
 let scoresCache = { key: null, value: null };
 
 export function sourceScores(events, birth, now = Date.now(), tail = PICK_TAIL) {
-  const last = events[events.length - 1];
-  const key = `${events.length}:${last?.id}:${last?.end}:${birth}:${tail}`;
+  const key = `${sleepsKey(events, birth).key}:${tail}`; // см. sleepsKey
   if (scoresCache.key === key) return scoresCache.value;
   const value = computeSourceScores(events, birth, now, tail);
   scoresCache = { key, value };
@@ -1439,8 +1535,37 @@ export function pickSource(events, birth, now = Date.now()) {
   return { key: "model", scores: sc, reason: "алгоритм не хуже" };
 }
 
+/*
+ * Сколько истории отдаётся прогнозу.
+ *
+ * Стоимость расчёта растёт примерно квадратично от длины дневника —
+ * замер на выросшей истории: 200 событий 16 мс, 392 — 99 мс, 783 —
+ * 563 мс, 1419 — 1976 мс. Это и есть причина того, что приложение,
+ * летавшее в первые месяцы, начинает заметно тормозить: данных просто
+ * становится больше, а расчёт идёт при каждом пересчёте окна.
+ *
+ * Уменьшать глубину подгонки (VALIDATION_DEPTH, PICK_TAIL) нельзя —
+ * это прямо ухудшает прогноз. Но алгоритму и НЕ НУЖНА вся история:
+ * он смотрит последние PICK_TAIL снов и подгоняет поправку по хвосту.
+ * Проверено сравнением результата на годовой истории и на срезах:
+ * начиная с 21 дня окно совпадает ДО МИНУТЫ, и на 90 днях тоже —
+ * 17:23–17:54 в обоих случаях, при 16 мс против 566 мс.
+ *
+ * 90 дней взяты с большим запасом к тому, где результат ещё сходится:
+ * запас нужен на случай редких записей (болезнь, поездка, дни с одной
+ * отметкой), когда за месяц набирается слишком мало снов.
+ *
+ * Отсечка стоит ЗДЕСЬ, а не в интерфейсе, чтобы её получили все
+ * вызывающие сразу — и экран, и расчёт уведомлений в store.js.
+ * Остальное приложение работает с полным дневником: графики роста,
+ * статистика и экспорт историю не теряют.
+ */
+export const HISTORY_CAP_DAYS = 90;
+
 export function predictNext(events, birth, now, manual = 0) {
-  const pick = pickSource(events, birth, now);
-  const w = windowBy(pick.key, events, birth, now, manual);
+  const from = now - HISTORY_CAP_DAYS * DAY;
+  const recent = events.filter((e) => e.start >= from);
+  const pick = pickSource(recent, birth, now);
+  const w = windowBy(pick.key, recent, birth, now, manual);
   return w && { ...w, source: pick.key, sourcePick: pick };
 }

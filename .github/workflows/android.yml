@@ -49,9 +49,14 @@ jobs:
           npm ci
           cd web && npm ci
 
+      # gradlew теряет флаг «исполняемый», если файлы репозитория когда-либо
+      # заливались через веб-интерфейс GitHub (Add file, drag-and-drop) —
+      # тот способ загрузки атрибуты выполнения не сохраняет. git обычно
+      # его хранит сам, но раз это уже однажды всплыло, чиним явно, а не
+      # надеемся на то, что в репозитории всё осталось как надо.
       - name: Права на gradlew
         run: chmod +x android/gradlew
-        
+
       # Автономный APK: фронтенд собирается с АБСОЛЮТНЫМ адресом API,
       # иначе внутри приложения запросы уйдут в никуда.
       - name: Сборка фронтенда и синхронизация
@@ -95,8 +100,14 @@ jobs:
       - name: Подписанная сборка
         if: steps.key.outputs.have == 'yes'
         working-directory: android
+        # Вызов через `sh`, а не `./gradlew` напрямую: так важно только
+        # право на ЧТЕНИЕ файла, а не на исполнение. Флаг «исполняемый»
+        # у gradlew теряется, если файлы репозитория когда-либо
+        # заливались через веб-редактор GitHub — это уже происходило,
+        # поэтому обходим проблему, а не только чиним её последствия
+        # шагом chmod (тот тоже оставлен, для локальных запусков).
         run: |
-          ./gradlew assembleRelease \
+          sh gradlew assembleRelease \
             -PMONITOR_KEYSTORE="$RUNNER_TEMP/monitor.keystore" \
             -PMONITOR_KEYSTORE_PASSWORD="${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" \
             -PMONITOR_KEY_ALIAS="${{ secrets.ANDROID_KEY_ALIAS }}" \
@@ -105,7 +116,7 @@ jobs:
       - name: Отладочная сборка
         if: steps.key.outputs.have == 'no'
         working-directory: android
-        run: ./gradlew assembleDebug
+        run: sh gradlew assembleDebug
 
       - name: Собрать APK в одно место
         run: |

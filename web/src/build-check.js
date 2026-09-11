@@ -28,6 +28,9 @@
  */
 
 const MY_BUILD = import.meta.url.split("/").pop() || "";
+
+/** Версия из web/package.json, подставляется при сборке (vite.config.js). */
+const MY_VERSION = typeof __APP_VERSION__ === "string" ? __APP_VERSION__ : null;
 const FLAG = "bt-build-reloaded";
 
 /*
@@ -53,14 +56,25 @@ let updateAvailable = false;
 export const isUpdateAvailable = () => updateAvailable;
 
 /** Вызывается из syncOnce с полем `build` из ответа сервера. */
-export function noteServerBuild(build) {
+export function noteServerBuild(build, version) {
+  /*
+   * Автономный APK сравнивает ВЕРСИЮ, а не имя файла.
+   *
+   * Его сборка идёт с другими BASE_PATH и VITE_API_URL, поэтому хеш
+   * содержимого отличается от серверного всегда — даже когда обе
+   * сборки сделаны из одного коммита. Сравнение хешей давало вечную
+   * плашку «вышла новая версия» на самой свежей сборке, что и
+   * случилось. Версия же одинакова, если коммит один.
+   */
+  if (BUNDLED) {
+    if (!version || !MY_VERSION) return;   // нечего сравнивать
+    updateAvailable = version !== MY_VERSION;
+    return;
+  }
+
   if (!build || !/\.js$/.test(MY_BUILD)) return; // дев-сервер: сравнивать нечего
   if (build === MY_BUILD) {
     updateAvailable = false;
-    return;
-  }
-  if (BUNDLED) {
-    updateAvailable = true; // перезагрузка не поможет — файлы внутри APK
     return;
   }
   try {

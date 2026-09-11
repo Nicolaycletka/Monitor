@@ -384,7 +384,7 @@ export async function syncOnce(state) {
   }
 
   // сверка сборок: телефон мог остаться на бандле прошлой версии
-  noteServerBuild(data.build);
+  noteServerBuild(data.build, data.version);
 
   // роль приезжает с каждым ответом: её могли поменять или отозвать,
   // пока телефон лежал в кармане, и узнать об этом надо тут же
