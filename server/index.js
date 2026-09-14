@@ -583,6 +583,56 @@ r.post("/api/members/:id/revoke", throttle, auth, requireParent, (req, res) => {
 });
 
 /*
+ * Сборка резервной копии. Одна на всех потребителей: и на отправку в
+ * Telegram, и на скачивание по ссылке. Разойтись они не должны — иначе
+ * одна копия окажется пригодной для восстановления, а вторая нет, и
+ * узнается это в худший момент.
+ *
+ * Полная строка семьи берётся через householdFull, а НЕ из
+ * req.household: тот приходит из auth и содержит только id и name.
+ * Именно на этом копия однажды уехала без даты рождения — файл был на
+ * вид целым и негодным для восстановления.
+ */
+function buildDump(householdId) {
+  const hh = householdFull.get(householdId);
+  if (!hh) return null;
+  return JSON.stringify({
+    profile: {
+      name: hh.name, birth: hh.birth, sex: hh.sex,
+      dueAt: hh.due_at, updatedAt: hh.profile_updated_at,
+    },
+    events: eventsSince.all(hh.id, 0).map((e) => ({
+      id: e.id, type: e.type, start: e.start, end: e.finish,
+      meta: e.meta ? JSON.parse(e.meta) : undefined,
+      deleted: e.deleted ? true : undefined,
+      updatedAt: e.updated_at,
+    })),
+    exportedAt: Date.now(),
+  }, null, 1);
+}
+
+/*
+ * Одноразовые ссылки на скачивание копии.
+ *
+ * Зачем. В автономном APK скачивание файла из WebView не работает:
+ * Android не обрабатывает blob-ссылки без отдельного DownloadListener.
+ * Зато внешнюю ссылку Capacitor отдаёт СИСТЕМНОМУ браузеру, а тот
+ * скачивает нормально, как любой файл. Нативного кода не требуется
+ * вовсе — что важно, потому что нативный код здесь непроверяем.
+ *
+ * Почему код в адресе, а не токен. Токен участника в адресной строке
+ * осел бы в истории браузера и в логах. Этот код живёт пять минут,
+ * сгорает при первом использовании и не даёт ничего, кроме одного
+ * файла.
+ *
+ * Почему в памяти, а не в базе. Перезапуск сервера обесценивает
+ * невостребованные коды — и хорошо: жить им всё равно пять минут.
+ * Таблица ради этого не нужна.
+ */
+const EXPORT_TTL_MS = 5 * 60000;
+const exportLinks = new Map();
+
+/*
  * Резервная копия в Telegram.
  *
  * Скачивание файла из автономного APK не работает: WebView не
@@ -598,25 +648,8 @@ r.post("/api/export-telegram", throttle, auth, requireParent, async (req, res) =
   const chats = telegramChatsFor.all(req.household.id);
   if (!chats.length) return res.status(400).json({ error: "no_chat" });
 
-  // req.household приходит из auth и содержит только id и name —
-  // для копии нужна полная строка, иначе в ней не будет даже даты
-  // рождения, а без неё восстановить дневник нельзя
-  const hh = householdFull.get(req.household.id);
-  if (!hh) return res.status(404).json({ error: "no_household" });
-
-  const dump = JSON.stringify({
-    profile: {
-      name: hh.name, birth: hh.birth, sex: hh.sex,
-      dueAt: hh.due_at, updatedAt: hh.profile_updated_at,
-    },
-    events: eventsSince.all(hh.id, 0).map((e) => ({
-      id: e.id, type: e.type, start: e.start, end: e.finish,
-      meta: e.meta ? JSON.parse(e.meta) : undefined,
-      deleted: e.deleted ? true : undefined,
-      updatedAt: e.updated_at,
-    })),
-    exportedAt: Date.now(),
-  }, null, 1);
+  const dump = buildDump(req.household.id);
+  if (!dump) return res.status(404).json({ error: "no_household" });
 
   const name = `sleep-${new Date().toISOString().slice(0, 10)}.json`;
   let sent = 0;
@@ -627,6 +660,33 @@ r.post("/api/export-telegram", throttle, auth, requireParent, async (req, res) =
   }
   if (!sent) return res.status(502).json({ error: "send_failed" });
   res.json({ ok: true, chats: sent, bytes: dump.length });
+});
+
+r.post("/api/export-link", throttle, auth, requireParent, (req, res) => {
+  const code = crypto.randomBytes(24).toString("base64url");
+  const now = Date.now();
+  // заодно подчищаем протухшее: карта иначе растёт бесконечно
+  for (const [k, v] of exportLinks) if (v.expires < now) exportLinks.delete(k);
+  exportLinks.set(code, { householdId: req.household.id, expires: now + EXPORT_TTL_MS });
+  res.json({ code, expiresAt: now + EXPORT_TTL_MS });
+});
+
+r.get("/api/export/:code", (req, res) => {
+  const entry = exportLinks.get(String(req.params.code || ""));
+  // одноразовость: удаляем ДО отдачи, повторное открытие ссылки из
+  // истории браузера не должно снова выгружать дневник
+  if (entry) exportLinks.delete(String(req.params.code));
+  if (!entry || entry.expires < Date.now()) {
+    return res.status(404).type("text/plain; charset=utf-8")
+      .send("Ссылка устарела или уже использована. Нажмите «Скачать копию» в приложении заново.");
+  }
+  const dump = buildDump(entry.householdId);
+  if (!dump) return res.status(404).json({ error: "no_household" });
+
+  const name = `sleep-${new Date().toISOString().slice(0, 10)}.json`;
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.setHeader("Content-Disposition", `attachment; filename="${name}"`);
+  res.send(dump);
 });
 
 r.get("/api/health", (_req, res) => res.json({ ok: true }));

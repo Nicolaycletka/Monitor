@@ -460,6 +460,25 @@ export async function revokeMember(token, id) {
 export const isViewer = (state) => state?.auth?.member?.role === "viewer";
 
 /** Ссылка вида t.me/bot?start=<householdId> — сервер сам знает username бота. */
+/**
+ * Одноразовая ссылка на скачивание копии.
+ *
+ * Нужна автономному APK: скачивание blob-ссылкой из WebView не
+ * работает, а внешнюю ссылку Capacitor отдаёт системному браузеру, и
+ * тот качает файл нормально. Код живёт пять минут и сгорает при первом
+ * использовании — в истории браузера не остаётся ничего ценного.
+ */
+export async function exportLink(token) {
+  const res = await fetch(`${API}/export-link`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error("link_failed");
+  const { code } = await res.json();
+  const base = API.startsWith("http") ? API : `${location.origin}${API}`;
+  return `${base}/export/${code}`;
+}
+
 /** Прислать резервную копию в привязанный чат Telegram. */
 export async function exportToTelegram(token) {
   const res = await fetch(`${API}/export-telegram`, {

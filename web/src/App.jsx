@@ -11,7 +11,7 @@ import {
   loadState, saveState, createHousehold, syncOnce, uid, liveEvents,
   inviteLink, readJoinToken, API, relink, fetchTelegramLink, MANUAL_BIAS_LIMIT,
   isViewer, redeemInvite, createInvite, fetchMembers, revokeMember,
-  exportToTelegram,
+  exportToTelegram, exportLink, BUNDLED,
 } from "./store.js";
 import { isUpdateAvailable } from "./build-check.js";
 import * as localNotify from "./notify-local.js";
@@ -486,11 +486,18 @@ export default function App() {
     setTimeout(runSync, 800);
   };
 
-  const logEvent = (type, meta) => {
+  /*
+   * `keepSheet` нужен бутылочке: там после выбора объёма прямо на месте
+   * чипов появляется подстройка ±10 мл, и закрывать лист нельзя — иначе
+   * приходится открывать его заново, чтобы поправить только что
+   * записанное. Остальным видам лист закрывать правильно: запись сделана,
+   * держать его открытым незачем.
+   */
+  const logEvent = (type, meta, keepSheet = false) => {
     const ev = { id: uid(), type, start: Date.now(), end: Date.now(), meta };
     putEvent(ev);
     flash(eventTitle(ev, nights), () => putEvent({ ...ev, deleted: true }));
-    setQuick(null);
+    if (!keepSheet) setQuick(null);
     setTimeout(runSync, 800);
     return ev.id; // чтобы объём можно было поправить сразу, не открывая редактор
   };
@@ -843,7 +850,7 @@ export default function App() {
                          * Лист НЕ закрывается: подстройка появляется прямо
                          * здесь, под пальцем.
                          */
-                        setJustFed({ id: logEvent("feed", { kind: bottle, ml }), ml });
+                        setJustFed({ id: logEvent("feed", { kind: bottle, ml }, true), ml });
                       }}>{ml} мл</button>
                     ))}
                   </div>
@@ -2010,6 +2017,68 @@ function LocalNotifySetting() {
 }
 
 /**
+ * Скачивание резервной копии. Одна кнопка, два разных пути.
+ *
+ * В ВЕБЕ — как раньше, файл собирается на месте и отдаётся
+ * blob-ссылкой. Работает даже без связи с сервером: данные и так лежат
+ * в телефоне.
+ *
+ * В АВТОНОМНОМ APK blob-ссылка не работает в принципе: Android WebView
+ * не обрабатывает такие ссылки без отдельного DownloadListener, и
+ * кнопка молча ничего не делала. Поэтому там приложение просит у
+ * сервера одноразовую ссылку и открывает её ВНЕШНЕ — Capacitor отдаёт
+ * внешние адреса системному браузеру, а тот качает файл как любой
+ * другой. Нативного кода не нужно вовсе, что здесь особенно ценно.
+ *
+ * Почему это лучше отправки в Telegram (она осталась рядом, как второй
+ * способ): не зависит от доступности мессенджера и от того, привязан
+ * ли чат, а файл попадает сразу в «Загрузки».
+ *
+ * Цена: в APK нужен доступ к серверу. Офлайн там остаётся Telegram —
+ * тоже недоступный офлайн. Полностью автономного способа сохранить
+ * копию из APK пока нет, и это честное ограничение.
+ */
+function BackupDownload({ state }) {
+  const [msg, setMsg] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const save = async () => {
+    setMsg(null);
+    if (!BUNDLED) {
+      const blob = new Blob(
+        [JSON.stringify({ profile: state.profile, events: state.events }, null, 1)],
+        { type: "application/json" }
+      );
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `sleep-${new Date().toISOString().slice(0, 10)}.json`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      return;
+    }
+    setBusy(true);
+    try {
+      const url = await exportLink(state.auth.token);
+      // _blank — Capacitor уводит внешний адрес в системный браузер
+      window.open(url, "_blank");
+      setMsg("Открыл ссылку в браузере — файл скачается туда же, куда обычно.");
+    } catch {
+      setMsg("Не удалось получить ссылку. Нужен доступ к серверу.");
+    }
+    setBusy(false);
+  };
+
+  return (
+    <>
+      <button className="sact ghost full" disabled={busy} onClick={save}>
+        {busy ? "Готовлю…" : "Скачать резервную копию"}
+      </button>
+      {msg && <p className="hint" style={{ marginBottom: 0 }}>{msg}</p>}
+    </>
+  );
+}
+
+/**
  * Резервная копия через Telegram.
  *
  * В автономном APK кнопка «скачать» не работает и работать не может:
@@ -2174,18 +2243,8 @@ function SettingsSheet({ state, events, update, onClose }) {
 
         <div className="sec">Данные</div>
         <div className="bt-card">
+          <BackupDownload state={state} />
           <BackupToTelegram token={state.auth.token} />
-          <button className="sact ghost full" onClick={() => {
-            const blob = new Blob([JSON.stringify({ profile: state.profile, events: state.events }, null, 1)],
-              { type: "application/json" });
-            const a = document.createElement("a");
-            a.href = URL.createObjectURL(blob);
-            a.download = `sleep-${new Date().toISOString().slice(0, 10)}.json`;
-            a.click();
-            URL.revokeObjectURL(a.href);
-          }}>
-            Скачать резервную копию
-          </button>
         </div>
 
         <div className="sheet-act">
