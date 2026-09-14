@@ -460,6 +460,17 @@ export async function revokeMember(token, id) {
 export const isViewer = (state) => state?.auth?.member?.role === "viewer";
 
 /** Ссылка вида t.me/bot?start=<householdId> — сервер сам знает username бота. */
+/** Прислать резервную копию в привязанный чат Telegram. */
+export async function exportToTelegram(token) {
+  const res = await fetch(`${API}/export-telegram`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}` },
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || "export_failed");
+  return data;
+}
+
 export async function fetchTelegramLink(token) {
   const res = await fetch(`${API}/telegram-link`, {
     headers: { authorization: `Bearer ${token}` },

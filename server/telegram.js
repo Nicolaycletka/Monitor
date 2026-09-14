@@ -33,6 +33,35 @@ export async function tgCall(method, params) {
   return data.result;
 }
 
+/**
+ * Отправка файла в чат.
+ *
+ * Нужна для резервной копии из автономного APK: скачивание по
+ * blob-ссылке в WebView не работает вовсе — Android не обрабатывает
+ * такие ссылки без отдельного DownloadListener, и кнопка «скачать»
+ * молча ничего не делала. Телеграм здесь оказался удобнее любого
+ * системного диалога: файл попадает в чат, где его видно с любого
+ * устройства и откуда он никуда не денется.
+ *
+ * Отдельная функция, а не tgCall: sendDocument требует multipart,
+ * а не JSON.
+ */
+export async function sendDocument(chatId, filename, content, caption = "") {
+  if (!TOKEN) return null;
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  if (caption) form.append("caption", caption.slice(0, 1024));
+  form.append("document", new Blob([content], { type: "application/json" }), filename);
+
+  const res = await fetch(`${BASE}/sendDocument`, { method: "POST", body: form });
+  const data = await res.json().catch(() => null);
+  if (!data?.ok) {
+    console.warn("telegram sendDocument failed", res.status, data?.description);
+    return null;
+  }
+  return data.result;
+}
+
 /** Жёсткий лимит Telegram на одно сообщение. */
 const TG_LIMIT = 4096;
 

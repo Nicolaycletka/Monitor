@@ -33,8 +33,9 @@ import {
   insertInvite,
   findInvite,
   useInvite,
+  householdFull,
 } from "./db.js";
-import { telegramEnabled, sendMessage, getMe, deleteWebhook, getUpdates } from "./telegram.js";
+import { telegramEnabled, sendMessage, getMe, deleteWebhook, getUpdates , sendDocument} from "./telegram.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 8090);
@@ -579,6 +580,53 @@ r.post("/api/members/:id/revoke", throttle, auth, requireParent, (req, res) => {
 
   revokeMember.run(Date.now(), id, req.household.id);
   res.json({ ok: true });
+});
+
+/*
+ * Резервная копия в Telegram.
+ *
+ * Скачивание файла из автономного APK не работает: WebView не
+ * обрабатывает blob-ссылки. Вместо борьбы с этим копия уходит в чат,
+ * привязанный к семье, — оттуда её видно с любого устройства.
+ *
+ * Данные берутся ИЗ БАЗЫ СЕРВЕРА, а не присылаются клиентом: копия
+ * должна отражать то, что реально сохранено, иначе она способна
+ * подтвердить сохранность того, чего на сервере нет.
+ */
+r.post("/api/export-telegram", throttle, auth, requireParent, async (req, res) => {
+  if (!telegramEnabled()) return res.status(503).json({ error: "telegram_disabled" });
+  const chats = telegramChatsFor.all(req.household.id);
+  if (!chats.length) return res.status(400).json({ error: "no_chat" });
+
+  // req.household приходит из auth и содержит только id и name —
+  // для копии нужна полная строка, иначе в ней не будет даже даты
+  // рождения, а без неё восстановить дневник нельзя
+  const hh = householdFull.get(req.household.id);
+  if (!hh) return res.status(404).json({ error: "no_household" });
+
+  const dump = JSON.stringify({
+    profile: {
+      name: hh.name, birth: hh.birth, sex: hh.sex,
+      dueAt: hh.due_at, updatedAt: hh.profile_updated_at,
+    },
+    events: eventsSince.all(hh.id, 0).map((e) => ({
+      id: e.id, type: e.type, start: e.start, end: e.finish,
+      meta: e.meta ? JSON.parse(e.meta) : undefined,
+      deleted: e.deleted ? true : undefined,
+      updatedAt: e.updated_at,
+    })),
+    exportedAt: Date.now(),
+  }, null, 1);
+
+  const name = `sleep-${new Date().toISOString().slice(0, 10)}.json`;
+  let sent = 0;
+  for (const c of chats) {
+    const ok = await sendDocument(c.chat_id, name, dump,
+      `Резервная копия дневника · записей ${JSON.parse(dump).events.length}`);
+    if (ok) sent++;
+  }
+  if (!sent) return res.status(502).json({ error: "send_failed" });
+  res.json({ ok: true, chats: sent, bytes: dump.length });
 });
 
 r.get("/api/health", (_req, res) => res.json({ ok: true }));

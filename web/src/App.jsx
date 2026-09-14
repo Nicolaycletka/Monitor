@@ -5,11 +5,13 @@ import {
   medianNapIn, typicalNap, autoBias, settleOf, settleStats,
   settleShare, settleNudge, SETTLE_KINDS, SETTLE_LABEL, SETTLE_HINT, RAW_ALARM,
   selfCheck, biasProfile, WINDOW_HALF,
+  PICK_TAIL,
 } from "./sleep.js";
 import {
   loadState, saveState, createHousehold, syncOnce, uid, liveEvents,
   inviteLink, readJoinToken, API, relink, fetchTelegramLink, MANUAL_BIAS_LIMIT,
   isViewer, redeemInvite, createInvite, fetchMembers, revokeMember,
+  exportToTelegram,
 } from "./store.js";
 import { isUpdateAvailable } from "./build-check.js";
 import * as localNotify from "./notify-local.js";
@@ -779,34 +781,6 @@ export default function App() {
 
             {offset === 0 && !viewer && (
             <>
-            {justFed && (
-              <div className="bt-card" style={{ padding: "10px 12px" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                  <button
-                    className="nudge"
-                    aria-label="Меньше на 10 мл"
-                    disabled={justFed.ml <= ML_STEP}
-                    onClick={() => adjustJustFed(-ML_STEP)}
-                  >−{ML_STEP}</button>
-
-                  <div style={{ flex: 1, textAlign: "center" }}>
-                    <span className="bt-num" style={{ fontSize: "1.3em" }}>{justFed.ml}</span> мл
-                  </div>
-
-                  <button
-                    className="nudge"
-                    aria-label="Больше на 10 мл"
-                    onClick={() => adjustJustFed(ML_STEP)}
-                  >+{ML_STEP}</button>
-
-                  <button className="sact ghost" onClick={() => setJustFed(null)}>Готово</button>
-                </div>
-                <p className="hint" style={{ marginBottom: 0 }}>
-                  Записано. Поправьте объём, если бутылочку допили не всю.
-                </p>
-              </div>
-            )}
-
             <div className="quick">
               <button className={"qbtn" + (nursing ? " on" : "")}
                 onClick={nursing ? stopNursing : startNursing}>
@@ -838,24 +812,46 @@ export default function App() {
                       onClick={() => setBottle(k)}>{l}</button>
                   ))}
                 </div>
-                <div className="chips">
-                  {[20, 30, 40, 60, 80, 100, 120, 150, 180].map((ml) => (
-                    <button key={ml} className="chip" onClick={() => {
-                      /*
-                       * Запись создаётся СРАЗУ, одним нажатием, и только
-                       * потом предлагается подстройка. Наоборот — сначала
-                       * набрать точный объём, потом подтвердить — хуже:
-                       * кормление отмечают с ребёнком на руках, и запись,
-                       * потерянная из-за незавершённого ввода, дороже
-                       * неточных двадцати миллилитров.
-                       */
-                      setJustFed({ id: logEvent("feed", { kind: bottle, ml }), ml });
-                      setQuick(null);
-                    }}>{ml} мл</button>
-                  ))}
-                </div>
+                {justFed ? (
+                  /*
+                   * Подстройка занимает МЕСТО ЧИПОВ, а не появляется над
+                   * ними. Иначе палец уже стоит внизу экрана, а изменение
+                   * происходит выше — приходится искать глазами то, что
+                   * только что нажал.
+                   */
+                  <div className="chips" style={{ alignItems: "center", gap: 12 }}>
+                    <button className="chip" disabled={justFed.ml <= ML_STEP}
+                      onClick={() => adjustJustFed(-ML_STEP)}>−{ML_STEP}</button>
+                    <span className="bt-num" style={{ fontSize: "1.25em", minWidth: 74, textAlign: "center" }}>
+                      {justFed.ml} мл
+                    </span>
+                    <button className="chip" onClick={() => adjustJustFed(ML_STEP)}>+{ML_STEP}</button>
+                    <button className="chip on" onClick={() => { setJustFed(null); setQuick(null); }}>Готово</button>
+                  </div>
+                ) : (
+                  <div className="chips">
+                    {[20, 30, 40, 60, 80, 100, 120, 150, 180].map((ml) => (
+                      <button key={ml} className="chip" onClick={() => {
+                        /*
+                         * Запись создаётся СРАЗУ, одним нажатием, и только
+                         * потом предлагается подстройка. Наоборот — сначала
+                         * набрать точный объём, потом подтвердить — хуже:
+                         * кормление отмечают с ребёнком на руках, и запись,
+                         * потерянная из-за незавершённого ввода, дороже
+                         * неточных двадцати миллилитров.
+                         *
+                         * Лист НЕ закрывается: подстройка появляется прямо
+                         * здесь, под пальцем.
+                         */
+                        setJustFed({ id: logEvent("feed", { kind: bottle, ml }), ml });
+                      }}>{ml} мл</button>
+                    ))}
+                  </div>
+                )}
                 <p className="hint">
-                  {bottle === "ebm"
+                  {justFed
+                    ? "Записано. Поправьте объём, если бутылочку допили не всю."
+                    : bottle === "ebm"
                     ? "Сцеженное грудное молоко: объём известен точно, и опорожняется оно как грудное, а не как смесь."
                     : bottle === "water"
                     ? "Вода в расчёт наполнения желудка не идёт: уходит быстро и своих констант у нас для неё нет."
@@ -1065,9 +1061,11 @@ function WindowBar({ win, now }) {
         {past ? (
           <>Окно прошло <b>{durShort(now - win.to)}</b> назад</>
         ) : inWin ? (
-          <>Окно открыто до <b>{hhmm(win.to)}</b></>
+          <>Окно <b>{hhmm(win.from)}</b> – <b>{hhmm(win.to)}</b> · открыто ещё {durShort(win.to - now)}</>
         ) : calming ? (
-          <>Пора сворачивать активность · окно с <b>{hhmm(win.from)}</b></>
+          // конец окна показываем и здесь: без него родитель видит,
+          // когда укладывание начинать, но не сколько у него времени
+          <>Пора сворачивать активность · окно <b>{hhmm(win.from)}</b> – <b>{hhmm(win.to)}</b></>
         ) : (
           <>Успокаиваться с <b>{hhmm(win.calm)}</b> · окно {hhmm(win.from)} – {hhmm(win.to)}</>
         )}
@@ -2011,6 +2009,47 @@ function LocalNotifySetting() {
   );
 }
 
+/**
+ * Резервная копия через Telegram.
+ *
+ * В автономном APK кнопка «скачать» не работает и работать не может:
+ * WebView не обрабатывает blob-ссылки без отдельного DownloadListener,
+ * так что нажатие молча ничего не делало. Файл уходит в привязанный
+ * чат — оттуда он доступен с любого устройства и никуда не денется.
+ *
+ * Копию собирает СЕРВЕР из своей базы, а не клиент из своей: копия
+ * должна отражать то, что реально сохранено. Иначе она способна
+ * подтвердить сохранность того, чего на сервере нет.
+ */
+function BackupToTelegram({ token }) {
+  const [state, setState] = useState("idle"); // idle | busy | done | error
+  const [msg, setMsg] = useState(null);
+
+  return (
+    <>
+      <button className="sact ghost full" disabled={state === "busy"} onClick={async () => {
+        setState("busy");
+        setMsg(null);
+        try {
+          const r = await exportToTelegram(token);
+          setState("done");
+          setMsg(`Отправлено · ${(r.bytes / 1024).toFixed(0)} КБ`);
+        } catch (e) {
+          setState("error");
+          setMsg(e.message === "no_chat"
+            ? "Сначала подключите Telegram в разделе «Неделя»."
+            : e.message === "telegram_disabled"
+            ? "Бот не настроен на сервере."
+            : "Не удалось отправить.");
+        }
+      }}>
+        {state === "busy" ? "Отправляю…" : "Прислать копию в Telegram"}
+      </button>
+      {msg && <p className="hint" style={{ marginBottom: 0 }}>{msg}</p>}
+    </>
+  );
+}
+
 function SettingsSheet({ state, events, update, onClose }) {
   const [tgLink, setTgLink] = useState(null);
   const [tgErr, setTgErr] = useState(false);
@@ -2135,6 +2174,7 @@ function SettingsSheet({ state, events, update, onClose }) {
 
         <div className="sec">Данные</div>
         <div className="bt-card">
+          <BackupToTelegram token={state.auth.token} />
           <button className="sact ghost full" onClick={() => {
             const blob = new Blob([JSON.stringify({ profile: state.profile, events: state.events }, null, 1)],
               { type: "application/json" });
@@ -2241,8 +2281,11 @@ function QualityCard({ state, events }) {
       <p className="hint">
         Сейчас работает <b>{sourceLabel(pick.key)}</b> — тот из трёх
         источников, что промахивался меньше на последних {scores[0].n} снах.
-        Смотрите не на абсолютную долю попаданий, а на отрыв выбранного
-        от остальных. Подробности — в настройках ⚙️.
+        Сравнение идёт по последним {PICK_TAIL} снам, и этого мало: на такой
+        выборке отрыв в 10 минут и меньше — случайность, он гуляет от сна
+        к сну. Значим только крупный и устойчивый разрыв. На всей истории
+        дневника поправки обычно опережают голые таблицы заметно сильнее,
+        чем видно здесь. Подробности — в настройках ⚙️.
       </p>
     </div>
   );
