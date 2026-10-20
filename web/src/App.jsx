@@ -291,9 +291,10 @@ export default function App() {
   // state.profile, а НЕ profile: деструктуризация { profile, bias } идёт
   // ниже по функции, и обращение к ней отсюда падает в мёртвую зону
   // объявления — сборка такое не ловит, приложение показывает пустой фон
+
   const nights = useMemo(
-    () => nightFragments(events, state?.profile?.birth, tick),
-    [events, state?.profile?.birth, tick]
+    () => nightFragments(events, state?.profile?.birth, winMinute * 60000),
+    [events, state?.profile?.birth, winMinute]
   );
   const active = events.find((e) => e.type === "sleep" && !e.end);
 
@@ -319,7 +320,7 @@ export default function App() {
    * и без округления прогноз считался бы четырежды в минуту без
    * пользы — границы окна показываются с точностью до минуты.
    */
-  const winMinute = Math.floor(tick / 60000);
+
 
   /*
    * Прогноз считается ПОСЛЕ отрисовки, а не во время неё.
@@ -2426,7 +2427,11 @@ function FeedModelCard({ state, events }) {
  * нельзя, и сигналы ребёнка точнее любого расчёта.
  */
 function FeedNote({ events, profile, now, feedsPerDay, pumpMl }) {
-  const p = predictFeed(events, profile.birth, profile.sex || null, now, feedsPerDay, pumpMl);
+  const nowMin = Math.floor(now / 60000) * 60000;
+  const p = useMemo(
+    () => predictFeed(events, profile.birth, profile.sex || null, nowMin, feedsPerDay, pumpMl),
+    [events, profile.birth, profile.sex, nowMin, feedsPerDay, pumpMl]
+  );
   if (!p) return null;
 
   if (p.empty) {

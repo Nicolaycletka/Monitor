@@ -234,9 +234,11 @@ export const sickNow = (events, now = Date.now()) =>
 
 /** Сны вне периодов болезни — то, по чему приложение учится. */
 export function healthySleeps(events) {
+  if (events._healthy) return events;
   const periods = illnessPeriods(events);
-  if (!periods.length) return events;
-  return events.filter((e) => e.type !== "sleep" || !isSickAt(e.start, periods));
+  const out = !periods.length ? events : events.filter((e) => e.type !== "sleep" || !isSickAt(e.start, periods));
+  if (out !== events) Object.defineProperty(out, "_healthy", { value: true });
+  return out;
 }
 
 /* ---------- склейка фрагментированного сна ---------- */
@@ -294,7 +296,16 @@ const inNightHours = (ts) => {
  * Показ на вкладках «День» и «Неделя» тоже остаётся сырым: родитель
  * записал два события и должен видеть два.
  */
+function markMerged(arr) {
+  Object.defineProperty(arr, "_merged", { value: true });
+  Object.defineProperty(arr, "_healthy", { value: true });
+  return arj;
+}
+function sliceMerged(arr, from, to) {
+  return markMerged(arr.slice(from, to));
+}
 export function mergeSleeps(events, birth) {
+  if (events._merged) return events;
   const sleeps = events
     .filter((e) => e.type === "sleep" && e.end && !e.deleted)
     .sort((a, b) => a.start - b.start);
@@ -322,7 +333,7 @@ export function mergeSleeps(events, birth) {
     }
     out.push({ ...s, ids: [s.id] });
   }
-  return out;
+  return markMerged(out);
 }
 
 /**
@@ -355,9 +366,12 @@ export function mergeSleeps(events, birth) {
  * события это не влияет — копия локальная.
  */
 export function nightFragments(events, birth, now = Date.now()) {
-  const closed = events.map((e) =>
-    e.type === "sleep" && !e.end && !e.deleted ? { ...e, end: now } : e
-  );
+  const cutoff = now - HISTORY_CAP_DAYS * DAY;
+  const closed = [];
+  for (const e of events) {
+    if (e.type !== "sleep" || e.deleted || (e.end && e.end < cutoff)) continue;
+    closed.push(!e.end ? { ...e, end: now } : e);
+  }
   const ids = new Set();
   for (const b of mergeSleeps(closed, birth)) {
     const night = b.meta?.night === true ? true
@@ -658,7 +672,8 @@ export function personalWindow(events, birth, now = Date.now()) {
   const sleeps = mergeSleeps(healthySleeps(events), birth).sort((a, b) => a.start - b.start);
 
   const first = sleeps[0], last = sleeps[sleeps.length - 1];
-  const key = `${sleeps.length}:${first?.start}:${last?.end}:${birth}:${now}`;
+  const nowBucket = Math.floor(now / (10 * MIN));
+  const key = `${sleeps.length}:${first?.start}:${last?.end}:${birth}:${nowBucket}`;
   if (fitCache.has(key)) return fitCache.get(key);
   const value = computePersonalWindow(sleeps, birth, now);
   if (fitCache.size >= FIT_CACHE_MAX) fitCache.clear();
@@ -677,7 +692,7 @@ function computePersonalWindow(sleeps, birth, now) {
     const awake = (cur.start - prev.end) / MIN;
     if (!(awake > 5 && awake < 360)) continue;
 
-    const hist = sleeps.slice(0, i);
+    const hist = sliceMerged(sleeps, 0, i);
     let shortPenalty = 0;
     if (!isNightSleep(prev)) {
       const len = (prev.end - prev.start) / MIN;
@@ -796,7 +811,7 @@ export function predictWindow(events, birth, now, bias = 0, opts = {}) {
   let shortPenalty = 0;
   if (!isNightSleep(last)) {
     const len = (last.end - last.start) / MIN;
-    const ref = typicalNap(sleeps, last.start, 10, birth, last);
+    const ref = typicalNap(sleeps, last.start, 10, birth, last, sleeps);
     if (ref != null) shortPenalty = 15 * clamp01((ref - len) / (ref * 0.3));
   }
 
@@ -1114,7 +1129,15 @@ let biasCache = { key: null, value: null };
  * Стоимость самой подписи — доли миллисекунды против секунд расчёта.
  */
 function sleepsKey(events, birth) {
-  const sleeps = mergeSleeps(healthySleeps(events), birth).sort((a, b) => a.start - b.start);
+  let sleeps = mergeSleeps(healthySleeps(events), birth);
+  if (sleeps.length > 1) {
+    const cutoff = sleeps[sleeps.length - 1].start - HISTORY_CAP_DAYS * DAY;
+    if (sleeps[0].start < cutoff) {
+      let idx = 0;
+      while (idx < sleeps.length && sleeps[idx].start < cutoff) idx++;
+      sleeps = sliceMerged(sleeps, idx);
+    }
+  }
   let acc = `${sleeps.length}:${birth}`;
   for (const s of sleeps) acc += `|${s.start},${s.end},${settleOf(s) || ""}`;
   return { key: acc, sleeps };
@@ -1141,7 +1164,7 @@ function computeBias(sleeps, birth) {
   const from = Math.max(1, sleeps.length - VALIDATION_DEPTH);
   for (let i = from; i < sleeps.length; i++) {
     if (isNightSleep(sleeps[i])) continue;
-    const before = sleeps.slice(0, i);
+    const before = sliceMerged(sleeps, 0, i);
     const w = predictWindow(before, birth, sleeps[i].start, 0);
     if (!w) continue;
     if (isExternal(sleeps[i])) continue; // не оценка прогноза — не считаем вовсе
@@ -1369,7 +1392,7 @@ function computeSelfCheck(events, birth, now) {
   const from = Math.max(1, sleeps.length - VALIDATION_DEPTH);
   for (let i = from; i < sleeps.length; i++) {
     if (isNightSleep(sleeps[i])) continue;
-    const before = sleeps.slice(0, i);
+    const before = sliceMerged(sleeps, 0, i);
     const at = sleeps[i].start;
 
     const m = measureBias(before, birth);
@@ -1377,7 +1400,7 @@ function computeSelfCheck(events, birth, now) {
     // ровно то, что применяется в predictNext, иначе сравнение мерит
     // не ту модель, которая работает
     const prof = biasProfile(m, sh.hardShare, sh.alertShare);
-    const shift = settleNudge(before, at, birth);
+    const shift = sh.hardShare == null ? 0 : -Math.round(SETTLE_NUDGE_MAX * sh.hardShare);
     const corr =
       typeof prof === "object"
         ? { early: prof.early + shift, late: prof.late + shift }
@@ -1453,7 +1476,7 @@ function modelWindow(events, birth, now, manual = 0) {
   // пока картина не изменится. Ручной сдвиг родителя остаётся.
   const off = Boolean(check && check.failing);
   const auto = off ? 0 : biasProfile(m, hardShare, alertShare);
-  const nudge = off ? 0 : settleNudge(events, now, birth);
+  const nudge = off ? 0 : (hardShare == null ? 0 : -Math.round(SETTLE_NUDGE_MAX * hardShare));
   // сдвиг по меткам и ручная добавка — скаляры, кладутся на обе половины
   const shift = nudge + (manual || 0);
   const bias =
@@ -1541,7 +1564,7 @@ function computeSourceScores(events, birth, now, tail) {
     // и его исключение относится ко всем четырём источникам одинаково
     if (isExternal(sleeps[i])) continue;
     const at = sleeps[i].start;
-    const before = sleeps.slice(0, i);
+    const before = sliceMerged(sleeps, 0, i);
     const ws = SOURCES.map((k) => windowBy(k, before, birth, at, 0));
     if (ws.some((w) => !w)) continue;
     ws.forEach((w, j) => {
@@ -1606,7 +1629,7 @@ export function pickSource(events, birth, now = Date.now()) {
  * Остальное приложение работает с полным дневником: графики роста,
  * статистика и экспорт историю не теряют.
  */
-export const HISTORY_CAP_DAYS = 90;
+export const HISTORY_CAP_DAYS = 45;
 
 export function predictNext(events, birth, now, manual = 0) {
   const from = now - HISTORY_CAP_DAYS * DAY;

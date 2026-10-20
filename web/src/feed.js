@@ -417,14 +417,15 @@ export function predictFeed(events, birth, sex, now = Date.now(), manualFeeds = 
   const lastFeed = milk.length ? milk[milk.length - 1] : null;
   if (!lastFeed) return { typical, lastFeed: null, empty: true };
 
-  const level = stomachAt(events, now, typical.ml, typical.refMin);
+  const recentMilk = milk.filter((e) => e.start >= now - 480 * MIN);
+  const level = stomachAt(recentMilk, now, typical.ml, typical.refMin);
   const target = READY_FRACTION * typical.ml;
 
   let readyAt = now;
   if (level > target) {
     // шаг в 5 минут: точность модели такова, что минуты бессмысленны
     for (let t = now; t <= now + 8 * 3600000; t += 5 * MIN) {
-      if (stomachAt(events, t, typical.ml, typical.refMin) <= target) { readyAt = t; break; }
+      if (stomachAt(recentMilk, t, typical.ml, typical.refMin) <= target) { readyAt = t; break; }
       readyAt = t;
     }
   }

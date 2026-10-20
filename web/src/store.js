@@ -252,7 +252,7 @@ function computeNotify(state) {
   if (active) return { sleep: null, feed: null, dev: devN };
 
   let sleepN = null;
-  const win = predictNext(events, birth, Date.now(), state.bias || 0);
+  const win = predictNext(events, birth, Math.floor(Date.now() / 60000) * 60000, state.bias || 0);
   if (win && !win.stale) {
     sleepN = {
       at: toMinute(win.calm),
