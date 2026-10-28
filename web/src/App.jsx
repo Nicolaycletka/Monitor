@@ -1,0 +1,3198 @@
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import {
+  MIN, DAY, startOfDay, hhmm, dur, durShort, ageText, ageMonths, dayLabel,
+  sleepNorm, isNightSleep, isNight, autoNight, nightFragments, sourceScores, pickSource, sourceLabel, TABLES, PICK_MARGIN, predictNext, daySegments, dayStats, measureBias,
+  medianNapIn, typicalNap, autoBias, settleOf, settleStats,
+  settleShare, settleNudge, SETTLE_KINDS, SETTLE_LABEL, SETTLE_HINT, RAW_ALARM,
+  selfCheck, biasProfile, WINDOW_HALF,
+  PICK_TAIL,
+} from "./sleep.js";
+import {
+  loadState, saveState, createHousehold, syncOnce, uid, liveEvents,
+  inviteLink, readJoinToken, API, relink, fetchTelegramLink, MANUAL_BIAS_LIMIT,
+  isViewer, redeemInvite, createInvite, fetchMembers, revokeMember,
+  exportToTelegram, exportLink, BUNDLED,
+} from "./store.js";
+import { isUpdateAvailable } from "./build-check.js";
+import * as localNotify from "./notify-local.js";
+import * as sleepNote from "./sleep-notification.js";
+import {
+  IND, IND_KEYS, SEX_LABEL, SEX_GEN, DAYS_PER_MONTH, maxDays, inRange,
+  zOf, valueAt, medianOf, pctText, measurements, gainRate, zTrend,
+  parseValue, valueText, GAIN_MIN_DAYS, Z_DROP_ALARM,
+} from "./growth.js";
+import {
+  predictFeed, perFeedMl, isDaytime, HALF_LIFE, READY_FRACTION,
+  breastVolume, typicalFeedMinutes, LETDOWN_TAU, dayFeedMl,
+} from "./feed.js";
+import { milestoneOverview } from "./milestones.js";
+
+/**
+ * Как мерить — по одной подсказке на показатель. Для длины и головы
+ * это не формальность: домашняя погрешность здесь сопоставима с самой
+ * величиной, которую мы отслеживаем (см. MEASURE_NOTE ниже).
+ */
+const MEASURE_HINT = {
+  weight: "Можно ввести и граммы — 6350 поймётся так же, как 6,35. Взвешивайте в одно и то же время и в одинаковом виде (лучше голышом, до кормления): домашние весы дают ±20–50 г, а полный подгузник — все 200.",
+  length: "Можно ввести и миллиметры — 614 поймётся так же, как 61,4. Длину меряют лёжа: ребёнок на ровной поверхности, макушка у неподвижного упора, ноги выпрямлены. Одному это сделать почти невозможно — нужен второй человек.",
+  head: "Можно ввести и миллиметры — 402 поймётся так же, как 40,2. Лента идёт по самой широкой части: над бровями и через самый выступающий затылочный бугор. Меряют трижды и берут наибольшее.",
+};
+
+/** Оговорка о точности — своя у каждого показателя, и разная по силе. */
+const MEASURE_NOTE = {
+  weight: "Ежедневное взвешивание дома почти всегда даёт больше тревоги, чем смысла: разброс между двумя измерениями подряд сопоставим с недельной прибавкой. Раз в неделю-две достаточно.",
+  length: "Здесь стоит быть особенно осторожным с домашними цифрами. Разброс длины у трёхмесячных — около 2 см на одну z-оценку, а ошибка измерения сантиметровой лентой на извивающемся ребёнке легко достигает того же сантиметра. То есть половина «изменения перцентиля» может оказаться тем, как в этот раз легли ноги. Цифрам с приёма у педиатра доверяйте больше, чем своим, и мерьте не чаще раза в месяц.",
+  head: "Разброс окружности головы у трёхмесячных — около 1.2 см на одну z-оценку, а расхождение между двумя обмерами лентой подряд бывает в полсантиметра. Поэтому меряют трижды и берут наибольшее, а выводы делают по цифрам с приёма, а не по домашним.",
+};
+
+/**
+ * Два раздела верхнего уровня, у каждого свой набор нижних вкладок.
+ * Разделение не косметическое: «Сон» — это то, что смотрят по
+ * несколько раз в день, «Здоровье» — то, что открывают раз в неделю.
+ * Держать их в одном ряду значило заставлять часто нажимаемое
+ * соседствовать с редким.
+ *
+ * Вторая вкладка раздела «Сон» называется «День», а не «Сегодня»:
+ * она листается стрелками на любую прошлую дату, и «Сегодня» было бы
+ * обещанием, которого экран не выполняет.
+ */
+const SECTIONS = {
+  sleep: {
+    label: "Трекер",
+    tabs: [["now", "Сейчас"], ["week", "Неделя"]],
+  },
+  health: {
+    label: "Здоровье",
+    tabs: IND_KEYS.map((k) => [k, IND[k].tab]),
+  },
+};
+
+/** Виды уведомлений: ключ, подпись, пояснение. */
+const NOTIFY_KINDS = [
+  ["sleep", "Пора укладывать", "Приходит в начале фазы успокоения, по прогнозу окна сна."],
+  ["feed", "Можно кормить", "Приходит, когда желудок освободился и прошёл обычный для ребёнка промежуток. Только днём, с 7 до 22."],
+  ["dev", "Вехи развития", "Раз в одну-три недели — что ждать в этом месяце и скачки развития. Не диагностика, просто заметки для интереса."],
+];
+
+const FEED_LABEL = {
+  breast: "Грудь", left: "ГВ, левая", right: "ГВ, правая",
+  formula: "Смесь", ebm: "Сцеженное молоко", solid: "Прикорм", water: "Вода",
+};
+
+/** Шаг подстройки объёма — цена деления на большинстве бутылочек. */
+const ML_STEP = 10;
+
+/** Что предлагается по кнопке «Бутылочка». */
+const BOTTLE_KINDS = [["formula", "Смесь"], ["ebm", "Молоко"], ["water", "Вода"]];
+const DIAPER_LABEL = { wet: "Мокрый", dirty: "Стул", mixed: "Мокрый и стул" };
+
+// Ветка по умолчанию раньше отсутствовала, и ЛЮБОЙ незнакомый тип
+// молча становился «Подгузник» — из-за этого запись о болезни
+// показывалась в дневнике как подгузник.
+const eventTitle = (e, nights) =>
+  e.type === "sleep"
+    ? isNight(e, nights) ? "Ночной сон" : "Сон"
+    : e.type === "feed"
+    ? FEED_LABEL[e.meta?.kind] +
+      (e.meta?.ml ? ` · ${e.meta.ml} мл` : "") +
+      (Number.isFinite(e.meta?.sec) ? ` · ${Math.round(e.meta.sec / 60)} мин` : "")
+    : e.type === "diaper"
+    ? DIAPER_LABEL[e.meta?.kind] || "Подгузник"
+    : e.type === "illness"
+    ? "Болезнь"
+    : IND[e.type]
+    ? `${IND[e.type].title} · ${valueText(IND[e.type], e.meta[IND[e.type].metaKey] || 0)} ${IND[e.type].unit}`
+    : e.type;
+
+const eventColor = (e) =>
+  e.type === "sleep" ? "#6c7bd9"
+    : e.type === "feed" ? "#e8a33d"
+    : e.type === "illness" ? "#c46a5a"
+    : IND[e.type] ? IND[e.type].color
+    : "#5f9e86";
+
+/**
+ * Взвешивание записывается на полдень указанного дня. Точное время
+ * никто не вводит, а полдень не уезжает в соседние сутки при смене
+ * часового пояса или переводе часов.
+ */
+const noonOf = (isoStr) => {
+  const [y, m, d] = isoStr.split("-").map(Number);
+  return new Date(y, m - 1, d, 12, 0, 0, 0).getTime();
+};
+
+/* ================================================================== */
+
+export default function App() {
+  const [state, setState] = useState(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [section, setSection] = useState("sleep");
+  const [tab, setTab] = useState("now");
+  const [tick, setTick] = useState(Date.now());
+  const [toast, setToast] = useState(null);
+  const [quick, setQuick] = useState(null);
+  /*
+   * Только что записанное кормление: { id, ml }. Держится ради полоски
+   * подстройки под кнопками — она позволяет поправить объём, не открывая
+   * редактор записи. Сбрасывается по «Готово» и при уходе с вкладки.
+   */
+  const [justFed, setJustFed] = useState(null);
+  const [bottle, setBottle] = useState("formula");
+  const [editing, setEditing] = useState(null);
+  const [offset, setOffset] = useState(0);
+  const [net, setNet] = useState({ status: "idle", error: null });
+  const [joinTok, setJoinTok] = useState(() => readJoinToken());
+  const [joinErr, setJoinErr] = useState(null);
+  const [joinBusy, setJoinBusy] = useState(false);
+
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const toastTimer = useRef(null);
+
+  useEffect(() => { loadState().then(setState); }, []);
+  useEffect(() => {
+    const t = setInterval(() => setTick(Date.now()), 15000);
+    return () => clearInterval(t);
+  }, []);
+
+  /* ---------- сохранение и синхронизация ---------- */
+
+  /*
+   * Единственный путь изменения состояния — поэтому режим «только
+   * просмотр» стоит ЗДЕСЬ, а не в каждом обработчике. Кнопки записи
+   * зрителю не показываются, но перекрыть надо и то, до чего он может
+   * дотянуться иначе (свайп, редактирование записи, настройки): иначе
+   * у него на телефоне копились бы записи, которые сервер молча
+   * отбрасывает, — призрачные данные, видимые только ему.
+   *
+   * Настоящая защита всё равно на сервере: здесь мы бережём зрителя
+   * от бессмысленных действий, а не семью от зрителя.
+   */
+  const update = useCallback((fn) => {
+    setState((prev) => {
+      if (isViewer(prev)) return prev;
+      const next = typeof fn === "function" ? fn(prev) : fn;
+      saveState(next);
+      return next;
+    });
+  }, []);
+
+  const runSync = useCallback(async () => {
+    const s = stateRef.current;
+    if (!s?.auth?.token) return;
+    setNet((n) => ({ ...n, status: "syncing" }));
+    try {
+      const merged = await syncOnce(s);
+      if (merged) {
+        setState(merged);
+        saveState(merged);
+      }
+      setNet({ status: "ok", error: null, at: Date.now() });
+    } catch (e) {
+      setNet({ status: "offline", error: e.message === "unauthorized" ? "unauthorized" : null });
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!state?.auth?.token) return;
+    runSync();
+    const t = setInterval(runSync, 30000);
+    const onVisible = () => document.visibilityState === "visible" && runSync();
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("online", runSync);
+    return () => {
+      clearInterval(t);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("online", runSync);
+    };
+  }, [state?.auth?.token, runSync]);
+
+  const doRelink = useCallback(async () => {
+    const s = stateRef.current;
+    if (!s) return;
+    setNet({ status: "syncing", error: null });
+    try {
+      const next = await relink(s);
+      setState(next);
+      saveState(next);
+      const merged = await syncOnce(next);
+      if (merged) {
+        setState(merged);
+        saveState(merged);
+      }
+      setNet({ status: "ok", error: null, at: Date.now() });
+    } catch (e) {
+      setNet({ status: "offline", error: "Не получилось перепривязать. Проверьте, что сервер отвечает." });
+    }
+  }, []);
+
+  /**
+   * Подключение к общему дневнику по ссылке. Локальные записи не
+   * затираются: они помечаются неотправленными и уезжают на сервер,
+   * а встречные приходят оттуда. Слияние по updatedAt, id у записей
+   * уникальные, поэтому дублей не возникает.
+   */
+  const doJoin = useCallback(async (join) => {
+    const s = stateRef.current;
+    setJoinBusy(true);
+    setJoinErr(null);
+    try {
+      // код приглашения меняем на СВОЙ токен; ссылки старого образца
+      // несут сам токен семьи и принимаются как есть
+      const got = join.kind === "code" ? await redeemInvite(join.value) : null;
+      const token = got ? got.token : join.value;
+      const next = {
+        ...s,
+        auth: { token, member: got?.member ?? null },
+        rev: 0,
+        profileDirty: false,
+        events: (s.events || []).map((e) => ({ ...e, dirty: true })),
+      };
+      const merged = (await syncOnce(next)) || next;
+      setState(merged);
+      saveState(merged);
+      history.replaceState(null, "", import.meta.env.BASE_URL);
+      setJoinTok(null);
+      setNet({ status: "ok", error: null, at: Date.now() });
+    } catch (e) {
+      setJoinErr(
+        e.message === "unauthorized"
+          ? "Ссылка не подошла — попросите прислать новую."
+          : "Сервер недоступен. Попробуйте ещё раз."
+      );
+    } finally {
+      setJoinBusy(false);
+    }
+  }, []);
+
+  const flash = (text, undo) => {
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    setToast({ text, undo });
+    toastTimer.current = setTimeout(() => setToast(null), 6000);
+  };
+
+  /* ---------- действия ---------- */
+
+  /*
+   * Ключ — именно `state.events`, а не весь `state`. Раньше здесь стоял
+   * `[state]`, и массив пересоздавался при ЛЮБОМ изменении состояния:
+   * правке поправки, ответе синка, смене настройки. Новая ссылка на
+   * массив рушила мемоизацию всего, что считается от событий, — в первую
+   * очередь прогноза, а он самый дорогой расчёт в приложении.
+   */
+  const events = useMemo(() => liveEvents(state?.events || []), [state?.events]);
+
+  /*
+   * Какие записи относятся к ночи с учётом склейки. Считается один раз
+   * на рендер и передаётся вниз: без этого сон в 05:45 после кормления
+   * в 05:19 показывался бы как дневной и попадал бы в счётчик «снов
+   * днём», хотя это продолжение той же ночи.
+   */
+  // state.profile, а НЕ profile: деструктуризация { profile, bias } идёт
+  // ниже по функции, и обращение к ней отсюда падает в мёртвую зону
+  // объявления — сборка такое не ловит, приложение показывает пустой фон
+
+  const nights = useMemo(
+    () => nightFragments(events, state?.profile?.birth, winMinute * 60000),
+    [events, state?.profile?.birth, winMinute]
+  );
+  const active = events.find((e) => e.type === "sleep" && !e.end);
+
+  /*
+   * Прогноз — самый дорогой расчёт приложения: замер на дневнике из
+   * 203 событий дал 16.8 мс против 0.1 мс у всего остального вместе
+   * взятого. Цена заложена в самом алгоритме (PICK_TAIL × глубина²
+   * подгонок, см. sleep.js), и уменьшать её там нельзя без потери
+   * качества — это уже проверялось замером.
+   *
+   * Поэтому его не удешевляют, а перестают звать зря. Раньше вызов
+   * стоял прямо в теле рендера: переключение вкладки, добавление
+   * кормления, любой ввод — и 16.8 мс заново, на телефоне заметно
+   * больше.
+   *
+   * Стоять этот хук обязан ЗДЕСЬ, выше ранних `return` для загрузки и
+   * первого запуска. Хук после условного выхода вызывается не на
+   * каждом рендере, и React падает с «Rendered more hooks than during
+   * the previous render» — сборка такого не ловит, приложение
+   * показывает пустой фон.
+   *
+   * Время огрубляется до минуты намеренно: тик идёт каждые 15 секунд,
+   * и без округления прогноз считался бы четырежды в минуту без
+   * пользы — границы окна показываются с точностью до минуты.
+   */
+
+
+  /*
+   * Прогноз считается ПОСЛЕ отрисовки, а не во время неё.
+   *
+   * Добавление сна — честный промах всех кешей, и пересчёт занимает
+   * около секунды на дневнике из 81 сна (замер; было восемь секунд до
+   * починки ключей и кеша личной прямой). Синхронный расчёт в теле
+   * рендера означал, что этот час миллисекунд родитель ждёт, глядя на
+   * замерший экран, — нажатие «Заснул» не отзывалось вообще.
+   *
+   * Теперь запись попадает в дневник и на экран немедленно, а окно
+   * пересчитывается следом. Прежнее значение при этом НЕ стирается:
+   * показывать пустоту вместо окна, пока считается новое, хуже, чем
+   * показывать слегка устаревшее. Единственное, что сбрасывается
+   * сразу, — окно во время сна, потому что оно бессмысленно.
+   *
+   * Задержка перед стартом намеренная. Нулевая тоже убрала бы расчёт
+   * из рендера, но он запустился бы вплотную к нему и успел бы
+   * подморозить анимацию нажатия и перерисовку списка. Четверть
+   * секунды хватает, чтобы интерфейс закончил работу.
+   */
+  const [win, setWin] = useState(null);
+  const [winBusy, setWinBusy] = useState(false);
+  const birth = state?.profile?.birth;
+
+  useEffect(() => {
+    if (active || !birth) {
+      setWin(null);
+      setWinBusy(false);
+      return;
+    }
+    let alive = true;
+    setWinBusy(true);
+    const id = setTimeout(() => {
+      const w = predictNext(events, birth, winMinute * 60000, state?.bias || 0);
+      if (!alive) return;
+      setWin(w);
+      setWinBusy(false);
+    }, 250);
+    return () => {
+      alive = false;
+      clearTimeout(id);
+    };
+  }, [active, events, birth, winMinute, state?.bias]);
+
+  /*
+   * Постоянное уведомление с кнопкой отметки сна.
+   *
+   * Держится в том же состоянии, что экран: если ребёнок спит — кнопка
+   * «Проснулся», если нет — «Заснул» и текст окна. Рассинхрон здесь
+   * опаснее отсутствия уведомления вовсе: кнопка, которая отмечает не
+   * то, что показывает, испортит дневник молча.
+   *
+   * Зрителю не показываем: он всё равно ничего не пишет, а кнопка,
+   * которая ничего не делает, хуже её отсутствия.
+   *
+   * Работает только в автономном APK с нативным плагином; в вебе весь
+   * модуль — пустышка, проверок платформы здесь намеренно нет.
+   */
+  useEffect(() => {
+    if (isViewer(state) || !state?.auth?.token) {
+      sleepNote.hideSleepNotification();
+      return;
+    }
+    const openSleep = active || null;
+    const text = openSleep
+      ? `Спит с ${hhmm(openSleep.start)}`
+      : win?.from
+        ? `Окно сна ${hhmm(win.from)}–${hhmm(win.to)}`
+        : "Окно сна пока не рассчитано";
+
+    sleepNote.showSleepNotification({ asleep: Boolean(openSleep), body: text });
+  }, [active, win?.from, win?.to, state?.auth?.token]);
+
+  /*
+   * Применение отметки, сделанной кнопкой в уведомлении.
+   *
+   * Кнопка только запускает приложение с пометкой; сама запись
+   * создаётся здесь — теми же `putEvent` и `runSync`, что и кнопка на
+   * экране. Отдельной ветки записи не существует, и держать две
+   * согласованными не нужно.
+   *
+   * Время берётся из пометки, а не текущее: между нажатием и
+   * готовностью приложения проходит секунда-другая.
+   *
+   * Проверяем при запуске и при каждом возврате на передний план —
+   * приложение могло быть уже открыто, тогда холодного старта не
+   * будет вовсе. Плагин гасит пометку при выдаче, поэтому лишние
+   * проверки безвредны.
+   */
+  useEffect(() => {
+    if (!state?.auth?.token || isViewer(state)) return;
+
+    let alive = true;
+    const apply = async () => {
+      const p = await sleepNote.consumePendingAction();
+      if (!alive || !p) return;
+      const st = stateRef.current;
+      const open = liveEvents(st?.events || []).find((e) => e.type === "sleep" && !e.end);
+
+      if (p.action === "wake_up") {
+        // закрывать нечего — приложение уже знает, что ребёнок не спит
+        if (!open) return;
+        putEvent({ ...open, end: p.at });
+        flash(`Проснулся · ${dur(p.at - open.start)}`, () => putEvent(open));
+      } else if (p.action === "fall_asleep") {
+        // сон уже открыт: повторная отметка создала бы второй
+        if (open) return;
+        const ev = { id: uid(), type: "sleep", start: p.at, end: null };
+        putEvent(ev);
+        flash("Заснул", () => putEvent({ ...ev, deleted: true }));
+      }
+      setTimeout(runSync, 800);
+    };
+
+    apply();
+    const onVisible = () => { if (document.visibilityState === "visible") apply(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      alive = false;
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [state?.auth?.token]);
+
+  /*
+   * Локальное уведомление о начале окна сна.
+   *
+   * Планируется от того же прогноза, что показан на экране, — отдельного
+   * расчёта нет, иначе они разъезжались бы. Пока ребёнок спит, окна нет,
+   * и запланированное снимается: показывать «пора укладываться» спящему
+   * — худшее, что приложение может сделать.
+   *
+   * В вебе весь модуль — пустышка, и это его забота, а не наша: здесь
+   * нет ни проверок платформы, ни try/catch вокруг вызовов.
+   */
+  useEffect(() => {
+    if (active || !win?.from) {
+      localNotify.cancelWindow();
+      return;
+    }
+    localNotify.scheduleWindow(
+      win.from,
+      `${state?.profile?.name || "Ребёнок"} бодрствует достаточно — можно укладывать`
+    );
+  }, [active, win?.from, state?.profile?.name]);
+
+
+  const putEvent = (ev) =>
+    update((s) => {
+      const rest = s.events.filter((e) => e.id !== ev.id);
+      return { ...s, events: [...rest, { ...ev, updatedAt: Date.now(), dirty: true }] };
+    });
+
+  const toggleSleep = () => {
+    if (active) {
+      const snapshot = active;
+      putEvent({ ...active, end: Date.now() });
+      flash(`Проснулся · ${dur(Date.now() - active.start)}`, () => putEvent(snapshot));
+    } else {
+      const ev = { id: uid(), type: "sleep", start: Date.now(), end: null };
+      putEvent(ev);
+      flash("Заснул", () => putEvent({ ...ev, deleted: true }));
+    }
+    setTimeout(runSync, 800);
+  };
+
+  /*
+   * `keepSheet` нужен бутылочке: там после выбора объёма прямо на месте
+   * чипов появляется подстройка ±10 мл, и закрывать лист нельзя — иначе
+   * приходится открывать его заново, чтобы поправить только что
+   * записанное. Остальным видам лист закрывать правильно: запись сделана,
+   * держать его открытым незачем.
+   */
+  const logEvent = (type, meta, keepSheet = false) => {
+    const ev = { id: uid(), type, start: Date.now(), end: Date.now(), meta };
+    putEvent(ev);
+    flash(eventTitle(ev, nights), () => putEvent({ ...ev, deleted: true }));
+    if (!keepSheet) setQuick(null);
+    setTimeout(runSync, 800);
+    return ev.id; // чтобы объём можно было поправить сразу, не открывая редактор
+  };
+
+  /*
+   * Шаг подстройки. 10 мл — цена деления на большинстве бутылочек, то
+   * есть меньший шаг всё равно не соответствовал бы тому, что реально
+   * можно разглядеть.
+   */
+  const adjustJustFed = (d) => {
+    setJustFed((cur) => {
+      if (!cur) return cur;
+      const ml = Math.max(ML_STEP, cur.ml + d);
+      const ev = stateRef.current?.events?.find((e) => e.id === cur.id);
+      // записи может не быть, если её успели отменить через «Отменить»
+      if (ev) putEvent({ ...ev, meta: { ...(ev.meta || {}), ml } });
+      return { ...cur, ml };
+    });
+    setTimeout(runSync, 800);
+  };
+
+  const setSettle = (ev, kind) => {
+    const cur = settleOf(ev);
+    const next = cur === kind ? undefined : kind;
+    putEvent({ ...ev, meta: { ...(ev.meta || {}), settle: next } });
+    setTimeout(runSync, 800);
+  };
+
+  // Период болезни задаётся датами, а не таймером: болезнь чаще всего
+  // отмечают задним числом, когда уже понятно, что это была она.
+  // Незакрытый период (end === null) означает «болеет до сих пор».
+  const openIllness = events.find((e) => e.type === "illness" && !e.end);
+
+  const saveIllness = ({ id, from, to }) => {
+    const ev = {
+      id: id || uid(),
+      type: "illness",
+      start: from,
+      end: to,
+    };
+    putEvent(ev);
+    flash(id ? "Период болезни обновлён" : "Период болезни добавлен");
+    setTimeout(runSync, 800);
+  };
+
+  const removeIllness = (ev) => {
+    const snapshot = { ...ev };
+    putEvent({ ...ev, deleted: true });
+    flash("Период удалён", () => putEvent(snapshot));
+    setTimeout(runSync, 800);
+  };
+
+  const shift = (ev, field, mins) => putEvent({ ...ev, [field]: ev[field] + mins * MIN });
+
+  /* ---------- кормление грудью по таймеру ---------- */
+
+  /*
+   * Незакрытое кормление — то же соглашение, что и у сна: end === null
+   * означает «идёт сейчас». Длительность на закрытии кладётся в
+   * meta.sec, а не выводится из end − start: запись потом можно
+   * подвинуть по времени, и длительность от этого меняться не должна.
+   */
+  // ВСЕ незакрытые, а не первая попавшаяся: если по любой причине
+  // открылось несколько, одна кнопка должна закрывать их разом,
+  // иначе таймер выглядит незакрываемым
+  const nursingAll = events.filter(
+    (e) => e.type === "feed" && !e.end && !e.deleted && e.meta?.kind === "breast"
+  );
+  const nursing = nursingAll[0] || null;
+
+  const startNursing = () => {
+    if (nursing) return; // второе открытое кормление не заводим
+    const ev = { id: uid(), type: "feed", start: Date.now(), end: null, meta: { kind: "breast" } };
+    putEvent(ev);
+    flash("Кормление грудью начато", () => putEvent({ ...ev, deleted: true }));
+    setTimeout(runSync, 800);
+  };
+
+  const stopNursing = () => {
+    if (!nursing) return;
+    const now = Date.now();
+    const snapshot = nursingAll.map((e) => ({ ...e }));
+    for (const e of nursingAll) {
+      const sec = Math.max(Math.round((now - e.start) / 1000), 30);
+      putEvent({ ...e, end: now, meta: { ...e.meta, sec } });
+    }
+    const sec = Math.max(Math.round((now - nursing.start) / 1000), 30);
+    flash(`Грудь · ${Math.round(sec / 60)} мин`, () => snapshot.forEach(putEvent));
+    setTimeout(runSync, 800);
+  };
+
+  /* ---------- антропометрия ---------- */
+
+  const addMeasure = (ind, value, ts) => {
+    const ev = {
+      id: uid(), type: ind.key, start: ts, end: ts,
+      meta: { [ind.metaKey]: value },
+    };
+    putEvent(ev);
+    flash(`${ind.title} ${valueText(ind, value)} ${ind.unit}`,
+      () => putEvent({ ...ev, deleted: true }));
+    setTimeout(runSync, 800);
+  };
+
+  const setSex = (sex) =>
+    update((s) => ({
+      ...s,
+      profile: { ...s.profile, sex, updatedAt: Date.now() },
+      profileDirty: true,
+    }));
+
+  const removeEvent = (ev) => {
+    putEvent({ ...ev, deleted: true });
+    setEditing(null);
+    flash("Запись удалена", () => putEvent({ ...ev, deleted: false }));
+    setTimeout(runSync, 800);
+  };
+
+  /* ---------- экраны ---------- */
+
+  if (!state) return <Splash text="Загружаю записи…" />;
+
+  const viewer = isViewer(state);
+
+  // ссылка пришла на телефон, где приложение уже настроено
+  if (
+    joinTok &&
+    // код приглашения токеном не является, поэтому сравнивать с ним
+    // осмысленно только ссылку старого образца
+    !(joinTok.kind === "token" && state.auth?.token === joinTok.value) &&
+    (state.profile || (state.events || []).length)
+  ) {
+    return (
+      <JoinPrompt
+        busy={joinBusy}
+        err={joinErr}
+        count={(state.events || []).filter((e) => !e.deleted).length}
+        onJoin={() => doJoin(joinTok)}
+        onSkip={() => {
+          history.replaceState(null, "", import.meta.env.BASE_URL);
+          setJoinTok(null);
+        }}
+      />
+    );
+  }
+
+  if (!state.profile || !state.auth) {
+    return <Onboarding onReady={(s) => { update(s); setTimeout(runSync, 300); }} />;
+  }
+
+  const { profile, bias } = state;
+
+
+  const napRef = active ? typicalNap(events, active.start, 10, profile.birth, active) : null;
+  const todayStart = startOfDay(tick);
+  // общие и для живого состояния, и для списка записей — раньше это
+  // было продублировано между вкладками "Сейчас" и "День"
+  const dayStart = todayStart - offset * DAY;
+  const dayList = events
+    .filter((e) => {
+      if (e.type === "illness") return false;
+      const end = e.type === "sleep" ? e.end ?? Date.now() : e.start;
+      return end >= dayStart && e.start < dayStart + DAY;
+    })
+    .sort((a, b) => b.start - a.start);
+  const pending = (state.events || []).filter((e) => e.dirty).length;
+
+  return (
+    <div className={"bt sec-" + section}>
+      <div className="bt-shell">
+        <header className="bt-head">
+          <span className="bt-name">{profile.name}</span>
+          <span className="bt-age">{ageText(profile.birth, tick)}</span>
+          <button className="gear-b" aria-label="Настройки" onClick={() => setSettingsOpen(true)}>
+            <GearIcon />
+          </button>
+        </header>
+
+        {viewer && (
+          <div className="bt-card" style={{ padding: "10px 12px", opacity: 0.85 }}>
+            Режим просмотра: записи видны, но менять их нельзя.
+          </div>
+        )}
+
+        {/*
+          * Только для автономной сборки: в вебе расхождение версий
+          * лечится перезагрузкой и происходит само, показывать нечего.
+          * В APK файлы лежат внутри приложения, обновить их может лишь
+          * переустановка — поэтому здесь единственный сигнал о том, что
+          * приложение устарело. Без него устаревший клиент снаружи
+          * неотличим от исправного, а это уже стоило нам раунда отладки.
+          */}
+        {isUpdateAvailable() && (
+          <div className="bt-card" style={{ padding: "10px 12px" }}>
+            Вышла новая версия приложения. Записи синхронизируются как обычно,
+            но расчёты и тексты у вас старые — попросите прислать свежий APK.
+          </div>
+        )}
+
+        {settingsOpen && (
+          <SettingsSheet state={state} events={events} update={update} onClose={() => setSettingsOpen(false)} />
+        )}
+
+        <div className="seg">
+          {Object.entries(SECTIONS).map(([k, sec]) => (
+            <button
+              key={k}
+              className={"seg-b" + (section === k ? " on" : "")}
+              onClick={() => {
+                // переключая раздел, всегда открываем его первую вкладку:
+                // иначе экран остался бы от прошлого раздела и нижние
+                // кнопки показывали бы не то, что открыто
+                setSection(k);
+                setTab(sec.tabs[0][0]);
+              }}
+            >
+              {sec.label}
+            </button>
+          ))}
+        </div>
+
+        {tab === "now" && (
+          <>
+            {offset === 0 && openIllness && (
+              <div className="bt-card sick">
+                <div className="sick-t">Болезнь · с {dayLabel(startOfDay(openIllness.start))}</div>
+                <p className="hint" style={{ marginTop: 6 }}>
+                  Записи за это время не идут в обучение. Дату выздоровления —
+                  на вкладке «Неделя».
+                </p>
+              </div>
+            )}
+
+            <div className="bt-head" style={{ marginBottom: 10 }}>
+              <button className="nudge wide" onClick={() => setOffset(offset + 1)}>←</button>
+              <span className="bt-name">{offset === 0 ? "Сегодня" : dayLabel(dayStart)}</span>
+              <button className="nudge wide" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - 1))}>→</button>
+            </div>
+
+            <div className="rib-wrap">
+              <Ribbon events={events} dayStart={dayStart} showNow={offset === 0} />
+              <Axis />
+            </div>
+
+            {offset === 0 && (
+            <section className="bt-card">
+              <div className="state">
+                <div className="state-label">
+                  {active ? (isNight(active, nights) ? "Ночной сон" : "Спит") : "Бодрствует"}
+                </div>
+                <div className="state-time bt-num">
+                  {active ? dur(tick - active.start) : win ? dur(tick - win.wokeAt) : "—"}
+                </div>
+                <div className="state-since">
+                  {active ? (
+                    <>
+                      <button className="nudge" onClick={() => shift(active, "start", -5)}>−5</button>
+                      <span className="bt-num">с {hhmm(active.start)}</span>
+                      <button className="nudge" onClick={() => shift(active, "start", 5)}>+5</button>
+                    </>
+                  ) : win ? (
+                    <span className="bt-num">проснулся в {hhmm(win.wokeAt)}</span>
+                  ) : (
+                    <span>Первая запись — нажмите «Заснул»</span>
+                  )}
+                </div>
+              </div>
+
+              {win && <WindowBar win={win} now={tick} />}
+              {active && !isNight(active, nights) && (
+                <>
+                  <NapNote start={active.start} now={tick} typical={napRef} />
+                  <SettlePicker
+                    value={settleOf(active)}
+                    onPick={(k) => setSettle(active, k)}
+                    hint="Только если было что отметить. Обычные укладывания отмечать не нужно — приложение считает их нормой."
+                  />
+                </>
+              )}
+
+              {!viewer && (
+                <button className={"big " + (active ? "wake" : "sleep")} onClick={toggleSleep}>
+                  {active ? "Проснулся" : "Заснул"}
+                </button>
+              )}
+            </section>
+            )}
+
+            {offset === 0 && !viewer && (
+            <>
+            <div className="quick">
+              <button className={"qbtn" + (nursing ? " on" : "")}
+                onClick={nursing ? stopNursing : startNursing}>
+                {nursing ? `Грудь · ${durShort(tick - nursing.start)}` : "Грудь"}
+              </button>
+              <button className="qbtn" onClick={() => setQuick(quick === "bottle" ? null : "bottle")}>Бутылочка</button>
+              <button className="qbtn" onClick={() => setQuick(quick === "diaper" ? null : "diaper")}>Подгузник</button>
+            </div>
+
+            {nursing && (
+              <>
+                <button className="big wake" onClick={stopNursing}>
+                  Закончить кормление · {durShort(tick - nursing.start)}
+                </button>
+                <p className="hint">
+                  Длительность пересчитается в вероятный объём.
+                  {nursingAll.length > 1 &&
+                    ` Открытых кормлений ${nursingAll.length} — закроются все разом.`}
+                </p>
+              </>
+            )}
+
+            {quick === "bottle" && (
+              <>
+                <div className="chips">
+                  {BOTTLE_KINDS.map(([k, l]) => (
+                    <button key={k}
+                      className={"chip" + (bottle === k ? " on" : "")}
+                      onClick={() => setBottle(k)}>{l}</button>
+                  ))}
+                </div>
+                {justFed ? (
+                  /*
+                   * Подстройка занимает МЕСТО ЧИПОВ, а не появляется над
+                   * ними. Иначе палец уже стоит внизу экрана, а изменение
+                   * происходит выше — приходится искать глазами то, что
+                   * только что нажал.
+                   */
+                  <div className="chips" style={{ alignItems: "center", gap: 12 }}>
+                    <button className="chip" disabled={justFed.ml <= ML_STEP}
+                      onClick={() => adjustJustFed(-ML_STEP)}>−{ML_STEP}</button>
+                    <span className="bt-num" style={{ fontSize: "1.25em", minWidth: 74, textAlign: "center" }}>
+                      {justFed.ml} мл
+                    </span>
+                    <button className="chip" onClick={() => adjustJustFed(ML_STEP)}>+{ML_STEP}</button>
+                    <button className="chip on" onClick={() => { setJustFed(null); setQuick(null); }}>Готово</button>
+                  </div>
+                ) : (
+                  <div className="chips">
+                    {[20, 30, 40, 60, 80, 100, 120, 150, 180].map((ml) => (
+                      <button key={ml} className="chip" onClick={() => {
+                        /*
+                         * Запись создаётся СРАЗУ, одним нажатием, и только
+                         * потом предлагается подстройка. Наоборот — сначала
+                         * набрать точный объём, потом подтвердить — хуже:
+                         * кормление отмечают с ребёнком на руках, и запись,
+                         * потерянная из-за незавершённого ввода, дороже
+                         * неточных двадцати миллилитров.
+                         *
+                         * Лист НЕ закрывается: подстройка появляется прямо
+                         * здесь, под пальцем.
+                         */
+                        setJustFed({ id: logEvent("feed", { kind: bottle, ml }, true), ml });
+                      }}>{ml} мл</button>
+                    ))}
+                  </div>
+                )}
+                <p className="hint">
+                  {justFed
+                    ? "Записано. Поправьте объём, если бутылочку допили не всю."
+                    : bottle === "ebm"
+                    ? "Сцеженное грудное молоко: объём известен точно, и опорожняется оно как грудное, а не как смесь."
+                    : bottle === "water"
+                    ? "Вода в расчёт наполнения желудка не идёт: уходит быстро и своих констант у нас для неё нет."
+                    : "Смесь задерживается в желудке дольше грудного молока — 65 минут против 47."}
+                </p>
+              </>
+            )}
+            {quick === "diaper" && (
+              <div className="chips">
+                {Object.entries(DIAPER_LABEL).map(([k, v]) => (
+                  <button key={k} className="chip" onClick={() => logEvent("diaper", { kind: k })}>{v}</button>
+                ))}
+              </div>
+            )}
+
+            </>
+            )}
+
+            {offset === 0 && (
+              <FeedNote events={events} profile={profile} now={tick}
+                feedsPerDay={state.feedsPerDay ?? null} pumpMl={state.pumpMl ?? null} />
+            )}
+
+            <Kpis stats={dayStats(events, dayStart, nights)} title={offset === 0 ? "Сегодня" : null} />
+
+            <div className="sec">Записи</div>
+            <div className="bt-card list">
+              {dayList.length === 0 ? (
+                <div className="empty">За этот день записей нет.</div>
+              ) : (
+                dayList.map((e) => (
+                  <button className="row" key={e.id} onClick={() => setEditing(e)}>
+                    <span className="dot" style={{ background: eventColor(e) }} />
+                    <span className="row-main">
+                      <span className="row-t">{eventTitle(e, nights)}</span>
+                      <span className="row-s bt-num">
+                        {e.start < dayStart && "вчера "}
+                        {hhmm(e.start)}{e.type === "sleep" && (e.end ? ` – ${hhmm(e.end)}` : " – сейчас")}
+                      </span>
+                    </span>
+                    {e.type === "sleep" && (
+                      <span className="row-r bt-num">{dur((e.end ?? Date.now()) - e.start)}</span>
+                    )}
+                  </button>
+                ))
+              )}
+            </div>
+            <p className="hint">Нажмите на запись, чтобы поправить время или удалить.</p>
+          </>
+        )}
+
+        {IND[tab] && (
+          <MeasureView ind={IND[tab]} profile={profile} events={events} now={tick}
+            onAdd={addMeasure} onSex={setSex} onPick={setEditing} />
+        )}
+
+        {tab === "week" && (
+          <WeekView state={state} events={events} nights={nights} update={update}
+            onSaveIllness={saveIllness} onRemoveIllness={removeIllness} />
+        )}
+
+        <NetLine net={net} pending={pending} onRetry={runSync} onRelink={doRelink} />
+      </div>
+
+      {toast && (
+        <div className="toast">
+          <span>{toast.text}</span>
+          {toast.undo && <button onClick={() => { toast.undo(); setToast(null); }}>Отменить</button>}
+        </div>
+      )}
+
+      {editing && (
+        <EditSheet
+          ev={events.find((e) => e.id === editing.id) || editing}
+          nights={nights}
+          onShift={(field, m) => {
+            const cur = events.find((e) => e.id === editing.id);
+            if (cur) shift(cur, field, m);
+          }}
+          onMl={(d) => {
+            const cur = events.find((e) => e.id === editing.id);
+            if (cur) putEvent({ ...cur, meta: { ...cur.meta, ml: Math.max(0, (cur.meta?.ml || 0) + d) } });
+          }}
+          onSeconds={(d) => {
+            const cur = events.find((e) => e.id === editing.id);
+            if (!cur) return;
+            // минимум 30 с — то же соглашение, что и при остановке таймера
+            const sec = Math.max((cur.meta?.sec || 0) + d, 30);
+            putEvent({ ...cur, meta: { ...cur.meta, sec } });
+          }}
+          onValue={(d) => {
+            const cur = events.find((e) => e.id === editing.id);
+            const ind = cur && IND[cur.type];
+            if (!ind) return;
+            const next = Math.min(Math.max((cur.meta?.[ind.metaKey] || 0) + d, ind.min), ind.max);
+            putEvent({ ...cur, meta: { ...cur.meta, [ind.metaKey]: next } });
+          }}
+          onNight={(v) => {
+            const cur = events.find((e) => e.id === editing.id);
+            if (!cur) return;
+            const meta = { ...cur.meta };
+            if (v === null) delete meta.night;
+            else meta.night = v;
+            putEvent({ ...cur, meta });
+          }}
+          onDays={(d) => {
+            const cur = events.find((e) => e.id === editing.id);
+            if (!cur) return;
+            const ts = cur.start + d * DAY;
+            putEvent({ ...cur, start: ts, end: ts });
+          }}
+          onClose={() => setEditing(null)}
+          onSettle={(k) => {
+            const cur = events.find((e) => e.id === editing.id);
+            if (cur) setSettle(cur, k);
+          }}
+          onDelete={() => removeEvent(events.find((e) => e.id === editing.id) || editing)}
+        />
+      )}
+
+      <nav className="tabs">
+        <div className="tabs-in">
+          {SECTIONS[section].tabs.map(([k, l]) => (
+            <button key={k} className={"tab" + (tab === k ? " on" : "")} onClick={() => setTab(k)}>{l}</button>
+          ))}
+        </div>
+      </nav>
+    </div>
+  );
+}
+
+/* ================================================================== */
+
+const Splash = ({ text }) => (
+  <div className="bt"><div className="bt-shell"><div className="empty">{text}</div></div></div>
+);
+
+/** Часовые деления через 3 часа — на весь день читаемо и на телефоне. */
+const AXIS_HOURS = [0, 3, 6, 9, 12, 15, 18, 21, 24];
+const Axis = () => (
+  <div className="rib-axis">
+    {AXIS_HOURS.map((h) => <span key={h}>{String(h).padStart(2, "0")}</span>)}
+  </div>
+);
+
+function Ribbon({ events, dayStart, showNow, height }) {
+  const segs = daySegments(events, dayStart);
+  const ticks = height
+    ? []
+    : events.filter((e) => e.type === "feed" && e.start >= dayStart && e.start < dayStart + DAY);
+  const nowPct = ((Date.now() - dayStart) / DAY) * 100;
+  return (
+    <div className="rib" style={height ? { height } : undefined}>
+      {segs.map((s, i) => (
+        <div key={i} className={"rib-seg" + (s.live ? " live" : "")}
+          style={{ left: `${(s.from / DAY) * 100}%`, width: `${((s.to - s.from) / DAY) * 100}%` }} />
+      ))}
+      {ticks.map((t) => (
+        <div key={t.id} className="rib-tick" style={{ left: `${((t.start - dayStart) / DAY) * 100}%` }} />
+      ))}
+      {showNow && nowPct >= 0 && nowPct <= 100 && (
+        <div className="rib-now" style={{ left: `${nowPct}%` }} />
+      )}
+    </div>
+  );
+}
+
+function WindowBar({ win, now }) {
+  if (win.stale) {
+    return (
+      <div className="win">
+        <p className="hint" style={{ marginTop: 0 }}>
+          Последняя запись — {hhmm(win.wokeAt)}, это было давно. Прогноз от неё
+          строить нечего: отметьте ближайший сон, и расчёт снова заработает.
+        </p>
+      </div>
+    );
+  }
+
+  const span = win.to - win.wokeAt;
+  const at = (t) => Math.min(Math.max(((t - win.wokeAt) / span) * 100, 0), 100);
+  const pct = Math.min(((now - win.wokeAt) / span) * 100, 100);
+  const past = now > win.to;
+  const inWin = now >= win.from && now <= win.to;
+  const calming = now >= win.calm && now < win.from;
+
+  const phase = past
+    ? { label: "Перегул", cls: "over" }
+    : inWin
+    ? { label: "Окно сна", cls: "sleep" }
+    : calming
+    ? { label: "Успокоение", cls: "calm" }
+    : { label: "Активное бодрствование", cls: "active" };
+
+  return (
+    <div className="win">
+      <div className="win-bar">
+        <div className="win-zone calm"
+          style={{ left: `${at(win.calm)}%`, width: `${at(win.from) - at(win.calm)}%` }} />
+        <div className="win-zone" style={{ left: `${at(win.from)}%`, right: 0 }} />
+        <div className="win-fill" style={{ width: `${pct}%` }} />
+      </div>
+
+      <div className={"phase " + phase.cls}>{phase.label}</div>
+
+      <div className="win-text bt-num">
+        {past ? (
+          <>Окно прошло <b>{durShort(now - win.to)}</b> назад</>
+        ) : inWin ? (
+          <>Окно <b>{hhmm(win.from)}</b> – <b>{hhmm(win.to)}</b> · открыто ещё {durShort(win.to - now)}</>
+        ) : calming ? (
+          // конец окна показываем и здесь: без него родитель видит,
+          // когда укладывание начинать, но не сколько у него времени
+          <>Пора сворачивать активность · окно <b>{hhmm(win.from)}</b> – <b>{hhmm(win.to)}</b></>
+        ) : (
+          <>Успокаиваться с <b>{hhmm(win.calm)}</b> · окно {hhmm(win.from)} – {hhmm(win.to)}</>
+        )}
+      </div>
+      {!win.circadian && (
+        <p className="hint">
+          До трёх месяцев циркадный ритм ещё не сформирован — сон в этом
+          возрасте определяется голодом, а не временем суток. Окно широкое
+          намеренно: это возрастной ориентир, а не расчёт по режиму.
+        </p>
+      )}
+      {win.circadian && !win.knownMorning && (
+        <p className="hint">
+          Утренний подъём не отмечен — считаю от 07:00. Отметьте ночной сон,
+          и прогноз станет точнее.
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Оценка идущего сна. Порог «короткого» — относительный, от медианы
+ * дневных снов самого ребёнка: тот же 0.7, что и в predictWindow.
+ * Абсолютные 45 минут в 3-5 месяцев срабатывали бы почти на каждом
+ * сне, когда все они становятся односцикловыми.
+ *
+ * Порог «поверхностного» остаётся абсолютным намеренно: цикл сна
+ * у младенца длится порядка 40-50 минут, и пробуждение до 25 минут
+ * означает неполный цикл независимо от того, какая у ребёнка медиана.
+ */
+function NapNote({ start, now, typical }) {
+  const len = (now - start) / MIN;
+  const short = typical != null ? typical * 0.7 : 45;
+  return (
+    <div className="win-text" style={{ marginTop: 16 }}>
+      {len < 25
+        ? "Меньше 25 минут — сон, скорее всего, поверхностный"
+        : len < short
+        ? `Короткий для него${typical != null ? ` (медиана ${Math.round(typical)} мин)` : ""} · следующее окно стоит сократить`
+        : "Полноценный сон"}
+    </div>
+  );
+}
+
+function Kpis({ stats, title }) {
+  return (
+    <>
+      {title && <div className="sec">{title}</div>}
+      <div className="kpi">
+        <div><div className="kpi-v bt-num">{durShort(stats.total)}</div><div className="kpi-l">всего сна</div></div>
+        <div><div className="kpi-v bt-num">{durShort(stats.night)}</div><div className="kpi-l">ночного</div></div>
+        <div><div className="kpi-v bt-num">{stats.naps}</div><div className="kpi-l">снов днём</div></div>
+        <div><div className="kpi-v bt-num">{stats.feeds} / {stats.diapers}</div><div className="kpi-l">кормлений / подгузников</div></div>
+      </div>
+    </>
+  );
+}
+
+function NetLine({ net, pending, onRetry, onRelink }) {
+  if (net.error === "unauthorized") {
+    return (
+      <div className="bt-card" style={{ marginTop: 22 }}>
+        <p className="hint" style={{ marginTop: 0 }}>
+          Сервер не узнаёт эту ссылку — обычно так бывает, если база на
+          сервере пересоздалась. Записи на телефоне целы. Перепривязка
+          заведёт дневник заново и отправит туда всю вашу историю.
+        </p>
+        <button className="sact ghost full" onClick={onRelink}>
+          Перепривязать к серверу
+        </button>
+        <p className="hint">
+          Старая ссылка для второго родителя перестанет работать — после
+          перепривязки отправьте новую из раздела «Неделя».
+        </p>
+      </div>
+    );
+  }
+  if (net.error) {
+    return <div className="net err">{net.error}</div>;
+  }
+  if (pending > 0 || net.status === "offline") {
+    return (
+      <div className="net">
+        {net.status === "offline" ? "Нет связи с сервером" : "Отправляю"}
+        {pending > 0 ? ` · ${pending} записей ждут` : ""}
+        <button onClick={onRetry}>Повторить</button>
+      </div>
+    );
+  }
+  return <div className="net ok">Синхронизировано</div>;
+}
+
+/* ================================================================== */
+
+
+/** Ввод дат — YYYY-MM-DD, локальная полночь. */
+const toInput = (ts) => {
+  const d = new Date(ts);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+};
+const fromInput = (v, endOfDay = false) => {
+  if (!v) return null;
+  const [y, m, d] = v.split("-").map(Number);
+  return endOfDay
+    ? new Date(y, m - 1, d, 23, 59, 59, 999).getTime()
+    : new Date(y, m - 1, d, 0, 0, 0, 0).getTime();
+};
+
+/**
+ * Периоды болезни задаются датами, а не таймером: болезнь обычно
+ * отмечают задним числом, когда уже понятно, что это была она,
+ * и «сейчас заболел / сейчас выздоровел» почти никогда не совпадает
+ * с реальными границами.
+ *
+ * Дату окончания можно оставить пустой — тогда период открытый
+ * («болеет до сих пор»).
+ */
+function IllnessCard({ periods, onSave, onRemove }) {
+  const [editId, setEditId] = useState(null);
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+
+  const open = (p) => {
+    setEditId(p ? p.id : "new");
+    setFrom(p ? toInput(p.start) : toInput(Date.now()));
+    setTo(p && p.end ? toInput(p.end) : "");
+  };
+  const close = () => setEditId(null);
+
+  const save = () => {
+    const start = fromInput(from);
+    const end = fromInput(to, true);
+    if (!start) return;
+    if (end && end < start) return;
+    onSave({ id: editId === "new" ? null : editId, from: start, to: end });
+    close();
+  };
+
+  const bad = from && to && fromInput(to, true) < fromInput(from);
+
+  return (
+    <div className="bt-card">
+      <p className="hint" style={{ marginTop: 0 }}>
+        Болезнь сбивает ритм сна, и если эти дни попадут в расчёт, приложение
+        запомнит их как норму ребёнка. Отмеченные периоды исключаются из
+        обучения, но остаются видны в дневнике.
+      </p>
+
+      {periods.length > 0 && (
+        <div className="ill-list">
+          {periods.map((p) => (
+            <div className="ill-row" key={p.id}>
+              <span className="ill-d bt-num">
+                {dayLabel(startOfDay(p.start))} –{" "}
+                {p.end ? dayLabel(startOfDay(p.end)) : "по сей день"}
+              </span>
+              <span className="ill-act">
+                <button className="nudge" onClick={() => open(p)}>Изменить</button>
+                <button className="nudge" onClick={() => onRemove(p)}>Убрать</button>
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {editId ? (
+        <>
+          <div className="field">
+            <span className="field-l">Начало</span>
+            <input className="ill-in" type="date" value={from}
+              onChange={(e) => setFrom(e.target.value)} />
+          </div>
+          <div className="field">
+            <span className="field-l">Окончание</span>
+            <input className="ill-in" type="date" value={to}
+              onChange={(e) => setTo(e.target.value)} />
+          </div>
+          <p className="hint">
+            {bad
+              ? "Окончание раньше начала — исправьте даты."
+              : to
+              ? "День окончания входит в период целиком."
+              : "Пустое окончание — болезнь продолжается."}
+          </p>
+          <div className="sheet-act">
+            <button className="sact ghost" onClick={close}>Отмена</button>
+            <button className="sact ghost" disabled={!from || bad} onClick={save}>
+              Сохранить
+            </button>
+          </div>
+        </>
+      ) : (
+        <button className="sact ghost full" onClick={() => open(null)}>
+          Добавить период болезни
+        </button>
+      )}
+    </div>
+  );
+}
+
+function WeekView({ state, events, nights, update, onSaveIllness, onRemoveIllness }) {
+  const today = startOfDay(Date.now());
+  const days = Array.from({ length: 7 }, (_, i) => today - (6 - i) * DAY);
+  const stats = days.map((d) => dayStats(events, d, nights));
+  const { birth, sex } = state.profile;
+  const feedModel = perFeedMl(events, birth, sex || null, Date.now(), state.feedsPerDay ?? null, state.pumpMl ?? null);
+  const foodStats = days.map((d) =>
+    feedModel ? dayFeedMl(events, d, feedModel.ml, feedModel.refMin) : null
+  );
+  // Из средних выбрасываются обрезанные сутки: первый день ведения
+  // дневника (он всегда начат с середины) и сегодняшний, который ещё
+  // не закончился. Раньше сегодняшний считался как полный и занижал
+  // всё на несколько часов — по нему нельзя было читать динамику.
+  const withData = stats.map((s, i) => ({ s, i })).filter(({ s }) => s.total > 0);
+  const drop = new Set();
+  if (withData.length > 1) drop.add(withData[0].i);
+  const kept = () => withData.filter(({ i }) => !drop.has(i));
+  // сегодняшний день выбрасывается только если после этого хоть что-то
+  // останется: в первый же день ведения дневника средние иначе обнулятся
+  if (kept().length > 1 && kept().some(({ i }) => i === 6)) drop.add(6);
+  const counted = kept().map(({ s }) => s);
+  const todayExcluded = drop.has(6);
+  const avg = (f) => (counted.length ? counted.reduce((a, s) => a + f(s), 0) / counted.length : 0);
+
+  const napNow = medianNapIn(events, today - 6 * DAY, today + DAY, nights);
+  const napBefore = medianNapIn(events, today - 13 * DAY, today - 6 * DAY, nights);
+  const norm = sleepNorm(ageMonths(state.profile.birth, Date.now()));
+  const weekEnd = today + DAY;
+  const illnessEvents = events
+    .filter((e) => e.type === "illness" && !e.deleted)
+    .sort((a, b) => b.start - a.start);
+  const check = selfCheck(events, state.profile.birth);
+  const shares = settleShare(events, Date.now(), state.profile.birth);
+  const bias = measureBias(events, state.profile.birth);
+  const auto = autoBias(bias, shares.hardShare, shares.alertShare);
+  // поправка может оказаться не числом, а парой «утро/вечер»
+  const profile_ = biasProfile(bias, shares.hardShare, shares.alertShare);
+  const win_slope = typeof profile_ === "object" ? profile_ : null;
+  const nudge = settleNudge(events, Date.now());
+  // сработал ли предохранитель: фильтры по меткам съели данные,
+  // а сырое расхождение велико
+  const rawFallback =
+    bias && !bias.usable && bias.raw && Math.abs(bias.raw.median) >= RAW_ALARM;
+  const settleNow = settleStats(events, weekEnd - 7 * DAY, weekEnd, state.profile.birth);
+  const settleBefore = settleStats(events, weekEnd - 14 * DAY, weekEnd - 7 * DAY, state.profile.birth);
+  return (
+    <>
+      <div className="sec" style={{ marginTop: 0 }}>Последние 7 дней</div>
+      {days.map((d, i) => (
+        <div className="week-row" key={d}>
+          <span className="week-lab">
+            {new Date(d).toLocaleDateString("ru-RU", { weekday: "short", day: "numeric" })}
+          </span>
+          <div className="week-rib">
+            <Ribbon events={events} dayStart={d} height={16} showNow={d === today} />
+          </div>
+          <span className="week-tot bt-num">{stats[i].total ? durShort(stats[i].total) : "—"}</span>
+          <span className="week-food bt-num">
+            {foodStats[i]
+              ? foodStats[i].n ? `${foodStats[i].ml} мл` : "—"
+              : stats[i].feeds ? `${stats[i].feeds}×` : "—"}
+          </span>
+        </div>
+      ))}
+      <div className="week-row">
+        <span className="week-lab" />
+        <div className="week-rib"><Axis /></div>
+        <span className="week-tot" />
+        <span className="week-food" />
+      </div>
+      <p className="hint" style={{ marginTop: -4 }}>
+        {feedModel
+          ? "Столбец еды — оценка объёма за сутки: точный для смеси и сцеженного молока, по длительности для кормлений грудью. Так же, как на вкладке «Сейчас»."
+          : "Столбец еды показывает число кормлений — для объёма в мл нужен пол ребёнка на вкладке «Вес»."}
+      </p>
+
+      <div className="sec">
+        В среднем за сутки{counted.length ? ` · ${counted.length} дн` : ""}
+      </div>
+      <div className="kpi">
+        <div><div className="kpi-v bt-num">{durShort(avg((s) => s.total))}</div><div className="kpi-l">всего сна</div></div>
+        <div><div className="kpi-v bt-num">{durShort(avg((s) => s.night))}</div><div className="kpi-l">ночного</div></div>
+        <div><div className="kpi-v bt-num">{durShort(avg((s) => s.day))}</div><div className="kpi-l">дневного</div></div>
+        <div><div className="kpi-v bt-num">{avg((s) => s.naps).toFixed(1)}</div><div className="kpi-l">снов днём</div></div>
+      </div>
+
+      <p className="hint">
+        {!norm
+          ? "Для возраста младше 4 месяцев суточной нормы сна не существует — разброс слишком велик. Сравнивать не с чем, смотрите на динамику."
+          : (() => {
+              const h = avg((s) => s.total) / 3600000;
+              const v = h === 0 ? "Данных пока мало." :
+                h < norm[0] ? `Ниже рекомендованных ${norm[0]}–${norm[1]} ч.` :
+                h > norm[1] ? `Выше рекомендованных ${norm[0]}–${norm[1]} ч.` :
+                `В пределах рекомендованных ${norm[0]}–${norm[1]} ч.`;
+              return `${v} Норма считается за 24 часа вместе с дневными снами. Часть снов вы наверняка забыли отметить, так что цифра снизу.`;
+            })()}
+      </p>
+
+      {(napNow != null || todayExcluded) && (
+        <p className="hint">
+          {napNow != null && (
+            <>
+              Медиана дневного сна за неделю — <b>{Math.round(napNow)} мин</b>
+              {napBefore != null && (
+                <>, неделей раньше <b>{Math.round(napBefore)} мин</b></>
+              )}.{" "}
+            </>
+          )}
+          {todayExcluded && "Сегодняшний день в средние не входит — сутки ещё не закончились."}
+        </p>
+      )}
+
+      <div className="sec">Болезнь</div>
+      <IllnessCard
+        periods={illnessEvents}
+        onSave={onSaveIllness}
+        onRemove={onRemoveIllness}
+      />
+
+      <div className="sec">Как проходят укладывания</div>
+      <div className="bt-card">
+        {settleNow.total === 0 ? (
+          <p className="hint" style={{ marginTop: 0 }}>
+            Записей за неделю пока нет.
+          </p>
+        ) : settleNow.marked === 0 ? (
+          <p className="hint" style={{ marginTop: 0 }}>
+            Отмеченных укладываний нет — приложение считает, что всё проходит
+            обычно. Если ребёнок плакал и не мог уснуть или наоборот был бодрым
+            и не хотел спать, отметьте это на вкладке «Сейчас» или в карточке сна.
+          </p>
+        ) : (
+          <>
+            <div className="kpi">
+              <div>
+                <div className="kpi-v bt-num">{settleNow.hard}</div>
+                <div className="kpi-l">плакал</div>
+              </div>
+              <div>
+                <div className="kpi-v bt-num">{settleNow.alert}</div>
+                <div className="kpi-l">был бодрый</div>
+              </div>
+            </div>
+            <p className="hint">
+              Плакал — <b>{settleNow.hard}</b>
+              {settleBefore.marked > 0 && <>, неделей раньше <b>{settleBefore.hard}</b></>}
+              . Был бодрый — <b>{settleNow.alert}</b>
+              {settleBefore.marked > 0 && <>, было <b>{settleBefore.alert}</b></>}
+              {` из ${settleNow.total} дневных снов`}.
+              {settleNow.hard > 0
+                ? " «Плакал» сдвигает окно раньше."
+                : ""}
+              {settleNow.alert > 0
+                ? " «Был бодрый» само окно не двигает — оно уже растянуто измеренной поправкой; метка лишь позволяет применить её полностью."
+                : ""}
+            </p>
+          </>
+        )}
+      </div>
+
+      {check && (
+        <>
+          <div className="sec">Самопроверка</div>
+          <div className={"bt-card" + (check.failing ? " sick" : "")}>
+            <div className="kpi">
+              <div>
+                <div className="kpi-v bt-num">{check.corrected}</div>
+                <div className="kpi-l">ошибка с поправками</div>
+              </div>
+              <div>
+                <div className="kpi-v bt-num">{check.table}</div>
+                <div className="kpi-l">ошибка по голой таблице</div>
+              </div>
+            </div>
+            <p className="hint">
+              {check.failing ? (
+                <>
+                  По {check.n} засыпаниям голая возрастная таблица оказалась
+                  точнее, чем алгоритм со всеми поправками. Поправки{" "}
+                  <b>временно отключены</b> — приложение считает по таблице,
+                  пока картина не изменится. Ручной сдвиг сохраняется.
+                </>
+              ) : (
+                <>
+                  По {check.n} засыпаниям поправки точнее голой возрастной
+                  таблицы на {check.table - check.corrected} мин. Сравнение
+                  смещено в пользу поправок: вы укладывали ребёнка по тому
+                  прогнозу, который приложение показывало. Поэтому обратный
+                  результат был бы сильным сигналом, а этот — умеренным.
+                </>
+              )}
+            </p>
+          </div>
+        </>
+      )}
+
+      <div className="sec">Поправка на вашего ребёнка</div>
+      <div className="bt-card">
+        {bias && (bias.usable || bias.raw) ? (
+          <>
+            {bias.usable && (
+              <p className="hint" style={{ marginTop: 0 }}>
+                По {bias.n} дневным снам ребёнок засыпает на{" "}
+                <b>{bias.median > 0 ? `${bias.median} мин позже` : `${-bias.median} мин раньше`}</b>{" "}
+                середины предсказанного окна (медиана, разброс ±{bias.spread} мин).
+              </p>
+            )}
+            {bias.raw && Math.abs(bias.raw.median - (bias.usable ? bias.median : bias.raw.median)) >= 15 && (
+              <p className="hint" style={{ marginTop: bias.usable ? undefined : 0 }}>
+                Без учёта меток расхождение — <b>{bias.raw.median} мин</b> по {bias.raw.n} снам.
+                Разница с цифрой выше означает, что метки укладывания заметно меняют картину.
+              </p>
+            )}
+            {rawFallback && (
+              <p className="hint">
+                Метки отсеяли почти все наблюдения, а расхождение велико — приложение
+                опирается на сырые данные. Обычно это значит, что возрастная таблица
+                просто не про вашего ребёнка.
+              </p>
+            )}
+            <div className="field">
+              <span className="field-l">Приложение применяет</span>
+              <span className="field-v bt-num">
+                {auto > 0 ? `+${auto}` : auto} мин
+              </span>
+            </div>
+            {win_slope && (
+              <div className="field">
+                <span className="field-l">Форма дня (утро / вечер)</span>
+                <span className="field-v bt-num">
+                  {win_slope.early > 0 ? `+${win_slope.early}` : win_slope.early}
+                  {" / "}
+                  {win_slope.late > 0 ? `+${win_slope.late}` : win_slope.late} мин
+                </span>
+              </div>
+            )}
+            {nudge !== 0 && (
+              <>
+                <div className="field">
+                  <span className="field-l">Сдвиг по меткам укладывания</span>
+                  <span className="field-v bt-num">{nudge} мин</span>
+                </div>
+
+              </>
+            )}
+            <p className="hint">
+              {auto === 0
+                ? "Почти не применяется: поправка мала или гасится тяжёлыми укладываниями."
+                : auto > 0
+                ? `Поправка «позже» берётся не целиком${
+                    shares.hardShare ? `, тяжёлых укладываний сейчас ${Math.round(shares.hardShare * 100)}%` : ""
+                  } — почему, в настройках ⚙️.`
+                : "Поправка «раньше» берётся целиком — ошибиться рано дёшево."}
+            </p>
+          </>
+        ) : (
+          <p className="hint" style={{ marginTop: 0 }}>
+            Нужно хотя бы пять дневных снов, чтобы посчитать поправку.
+          </p>
+        )}
+        {state.biasResetFrom != null && (
+          <>
+            <p className="hint">
+              Прежняя ручная поправка{" "}
+              <b>{state.biasResetFrom > 0 ? `+${state.biasResetFrom}` : state.biasResetFrom} мин</b>{" "}
+              снята. Раньше она хранила всю поправку целиком, теперь приложение
+              считает её само — старое значение прибавилось бы вторым разом.
+            </p>
+            <button
+              className="sact ghost full"
+              onClick={() => update((s) => ({ ...s, biasResetFrom: null }))}
+            >
+              Понятно
+            </button>
+          </>
+        )}
+        <div className="field">
+          <span className="field-l">Ручной сдвиг сверх этого</span>
+          <div className="field-c">
+            <button
+              className="nudge"
+              disabled={(state.bias || 0) <= -MANUAL_BIAS_LIMIT}
+              onClick={() => update((s) => ({ ...s, bias: Math.max((s.bias || 0) - 5, -MANUAL_BIAS_LIMIT) }))}
+            >−5</button>
+            <span className="field-v bt-num">{state.bias > 0 ? `+${state.bias}` : state.bias || 0}</span>
+            <button
+              className="nudge"
+              disabled={(state.bias || 0) >= MANUAL_BIAS_LIMIT}
+              onClick={() => update((s) => ({ ...s, bias: Math.min((s.bias || 0) + 5, MANUAL_BIAS_LIMIT) }))}
+            >+5</button>
+          </div>
+        </div>
+        {(state.bias || 0) !== 0 && (
+          <button className="sact ghost full" onClick={() => update((s) => ({ ...s, bias: 0 }))}>
+            Сбросить в ноль
+          </button>
+        )}
+      </div>
+
+      <div className="sec">Точность прогноза</div>
+      <QualityCard state={state} events={events} />
+
+      <div className="sec">Кормления</div>
+      <FeedModelCard state={state} events={events} />
+
+      <div className="sec">Вехи развития</div>
+      <MilestonesCard state={state} />
+
+    </>
+  );
+}
+
+/**
+ * Переключатели видов уведомлений.
+ *
+ * Настройка общая на семью, а не на телефон: она едет через профиль
+ * тем же LWW-механизмом, что имя и дата рождения, и второй родитель
+ * получает её при ближайшей синхронизации. Раздельная настройка на
+ * каждого родителя потребовала бы привязки к chat_id — это другая
+ * задача, и пока непонятно, нужна ли она.
+ *
+ * Хранится список ОТКЛЮЧЁННЫХ видов: тогда вид, добавленный в будущей
+ * версии, заработает сам, а не окажется молча выключенным.
+ */
+/**
+ * ПДР и обзор вех развития.
+ *
+ * ПДР — необязательное поле, влияет только на расчёт СКАЧКОВ развития
+ * (по мотивам Wonder Weeks): исходная методика считает их строго от
+ * предполагаемой даты родов, а не от фактической — для родившихся
+ * не в срок это меняет момент скачка на недели. Ежемесячные вехи
+ * навыков всегда считаются от даты рождения, ПДР на них не влияет.
+ */
+function MilestonesCard({ state }) {
+  const { birth, dueAt } = state.profile;
+  const ov = milestoneOverview(birth, dueAt ?? null, Date.now());
+
+  return (
+    <div className="bt-card">
+      <p className="hint" style={{ marginTop: 0 }}>
+        {dueAt
+          ? "Скачки развития считаются от указанной вами ПДР — точнее для родившихся не в срок."
+          : "ПДР не указана — скачки развития считаются от даты рождения. Указать её можно в настройках ⚙️."}
+      </p>
+      {ov && (
+        <>
+          <div className="field">
+            <span className="field-l">Пройдено вех</span>
+            <span className="field-v bt-num">{ov.passed}/{ov.total}</span>
+          </div>
+          {ov.next && (
+            <p className="hint">
+              Ближайшее — {dayLabel(ov.next.at)}: {ov.next.lead}
+            </p>
+          )}
+        </>
+      )}
+      <p className="hint">
+        Пуш приходит примерно раз в одну-три недели: ежемесячные заметки
+        о навыках и «красных флагах» (от фактической даты рождения) плюс
+        отдельно — скачки развития по неделям. Это не диагностика и не
+        предсказание вашего ребёнка конкретно — общие ориентиры для
+        интереса и повод спросить педиатра, если что-то настораживает.
+      </p>
+    </div>
+  );
+}
+
+/**
+ * Раздел «Как считается» — всё длинное методологическое объяснение,
+ * которое раньше было размазано по вкладкам между цифрами.
+ *
+ * Смысл разделения: во вкладках остаётся только то, что помогает
+ * ДЕЙСТВОВАТЬ — что делает кнопка, на что смотреть, куда нажать,
+ * чтобы поправить. Объяснение, ПОЧЕМУ число такое, нужно один раз
+ * и по своей инициативе, а не при каждом взгляде на экран. Текст
+ * не сокращён: честность формулировок и оговорки про слабые места
+ * расчёта важнее краткости — просто перенесены туда, где их читают
+ * осознанно.
+ *
+ * Раскрывается по клику, всё свёрнуто по умолчанию: иначе настройки
+ * превратились бы в простыню, из которой не найти переключатель.
+ */
+function InfoSection({ title, children }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="bt-card info-block">
+      <button className="info-h" onClick={() => setOpen(!open)} aria-expanded={open}>
+        <span>{title}</span>
+        <span className="info-x">{open ? "−" : "+"}</span>
+      </button>
+      {open && <div className="info-body">{children}</div>}
+    </div>
+  );
+}
+
+function HowItWorks({ state, events }) {
+  const { birth, sex } = state.profile;
+  const t = perFeedMl(events, birth, sex || null, Date.now(),
+    state.feedsPerDay ?? null, state.pumpMl ?? null);
+
+  return (
+    <>
+      <InfoSection title="Окно сна">
+        <p className="hint" style={{ marginTop: 0 }}>
+          Окно всегда одной ширины — {WINDOW_HALF * 2} минут, в любом возрасте
+          и у любого источника прогноза. Раньше оно расширялось вслед за
+          разбросом засыпаний, и промах от этого становился незаметен, хотя
+          никуда не девался. Попасть в окно — задача алгоритма, а не границ.
+        </p>
+        <p className="hint">
+          Приложение считает прогноз четырьмя способами: собственным
+          алгоритмом (личная прямая по вашим данным плюс поправка) и тремя
+          таблицами возраста. Берётся тот, что промахивался меньше на
+          последних дневных снах. Алгоритм держит фору в {PICK_MARGIN} минуты:
+          он единственный, кто учится на вашем ребёнке, и менять его на
+          статичную таблицу из-за минутного перевеса значило бы выучить шум.
+        </p>
+        <p className="hint">
+          Чужие таблицы взяты как опубликованы, без усреднения и правок.{" "}
+          {TABLES.huck.label}: {TABLES.huck.note}. Своя — {TABLES.app.note}.
+        </p>
+        <p className="hint">
+          Поправка «позже» берётся не целиком и тем слабее, чем чаще
+          укладывания идут тяжело: сдвинув окно позже, приложение заставит
+          вас класть позже и потом измерит собственный сдвиг как факт
+          о ребёнке. Поправка «раньше» берётся целиком — ошибиться рано
+          дёшево: ребёнок не уснул, попробовали через четверть часа.
+        </p>
+        <p className="hint">
+          Дни болезни в обучение не идут, фрагменты ночного сна склеиваются
+          в один: иначе пробуждение внутри ночи давало бы наблюдение
+          с окном бодрствования в двадцать минут.
+        </p>
+      </InfoSection>
+
+      <InfoSection title="Кормления">
+        <p className="hint" style={{ marginTop: 0 }}>
+          Приложение не предсказывает голод — оно считает, освободился ли
+          желудок. Это разные вещи: голод зависит не только от того, пусто ли
+          в желудке. Поэтому формулировка везде «можно кормить», а не «пора»,
+          и кормление по требованию она не заменяет.
+        </p>
+        <p className="hint">
+          Опорожнение желудка считается экспоненциальным, период
+          полувыведения — {HALF_LIFE.breast} мин для грудного молока
+          и {HALF_LIFE.formula} мин для смеси (дыхательный тест
+          с 13C-октановой кислотой у доношенных). Разброс в исходном
+          исследовании огромный, 16–86 и 27–98 минут, так что расчёт даёт
+          порядок величины, а не минуты.
+        </p>
+        <p className="hint">
+          Кормление грудью записывается таймером, и длительность переводится
+          в объём насыщающей кривой <b>1 − exp(−t/{LETDOWN_TAU})</b>: молоко
+          уходит не равномерно, основная часть передаётся в первые минуты.
+          Постоянная подобрана так, чтобы к 10.5 минутам — средней
+          длительности кормления в исследовании с контрольным взвешиванием
+          доношенных — передавалось около 93 % объёма.
+          {t && t.refMin != null && <> Ваша медианная длительность — {Math.round(t.refMin)} мин,
+          при ней кривая даёт ровно типичный объём.</>}
+        </p>
+        <p className="hint">
+          Из литературы взята только ФОРМА кривой. Величина — своя: в том же
+          исследовании при средних 119.5 г на кормление разброс был 34–222 г,
+          то есть шестикратный, и брать оттуда абсолютные миллилитры
+          бессмысленно.
+        </p>
+        <p className="hint">
+          Объём кормления для груди никто не измеряет — это главная слабость
+          расчёта. Он выводится из суточного объёма по возрасту, делённого
+          на ваше собственное число кормлений. Для смеси и сцеженного молока
+          берётся введённый объём.
+        </p>
+        <p className="hint">
+          Число кормлений в сутки — медиана по ПОЛНЫМ дням: тем, где есть
+          кормление и до 9 утра, и после 19 вечера. Считать по числу записей
+          нельзя: тогда «мало кормлений» и «мало отмечено» неразличимы,
+          и неполные дни занижают медиану, а порция от этого завышается.
+        </p>
+        <p className="hint">
+          Если задано утреннее сцеживание одной груди, объём считается прямо
+          от этой цифры. Две оговорки: помпа обычно извлекает меньше, чем
+          эффективно сосущий ребёнок (в исследовании дети высасывали
+          в среднем около 67 % доступного молока), а утренняя выработка
+          обычно самая высокая за сутки — то есть цифра скорее осторожная,
+          но может быть выше типичной дневной порции.
+        </p>
+        <p className="hint">
+          Пропуск в записях сам по себе ничего не значит. Но если промежуток
+          закрыт отмеченным сном, приложение знает, что ребёнок не ел, —
+          и считает промежуток настоящим. Длинный промежуток без сна и без
+          записей считается дыркой в дневнике, и напоминание не приходит.
+        </p>
+        <p className="hint">
+          Через три часа от прошлого кормления в желудке остаётся около
+          десятой части — расчёт «забывает» пропущенный кусок дня сам собой,
+          и одного отмеченного кормления хватает, чтобы он снова стал
+          осмысленным.
+        </p>
+      </InfoSection>
+
+      <InfoSection title="Рост, вес, окружность головы">
+        <p className="hint" style={{ marginTop: 0 }}>
+          Кривые — WHO Child Growth Standards (2006), таблицы L/M/S:
+          по неделям до 13 недель и по месяцам дальше. Перцентиль считается
+          из z-оценки по этим параметрам, а не берётся из готовой таблицы,
+          поэтому промежуточные возрасты считаются точно, а не округляются
+          до ближайшей недели.
+        </p>
+        <p className="hint">
+          Стандарт построен на доношенных детях. Для родившегося раньше
+          срока возраст положено считать скорректированным — приложение
+          этого не умеет, и перцентиль будет занижен.
+        </p>
+        <p className="hint">
+          Длина обрывается на двух годах: после этого ВОЗ измеряет рост
+          стоя, а это другая величина, примерно на 0.7 см меньше. Вес
+          и голова идут до пяти лет.
+        </p>
+        <p className="hint">
+          Между взвешиваниями вес не держится константой, а проецируется
+          вперёд вдоль того же перцентильного канала: здоровый ребёнок
+          в норме держится примерно одной z-оценки, а не одного веса в кг.
+        </p>
+        <p className="hint">{MEASURE_NOTE.length}</p>
+        <p className="hint">{MEASURE_NOTE.head}</p>
+      </InfoSection>
+
+      <InfoSection title="Вехи развития">
+        <p className="hint" style={{ marginTop: 0 }}>
+          Пуш приходит примерно раз в одну-три недели: ежемесячные заметки
+          о навыках и «красных флагах» (от фактической даты рождения) плюс
+          отдельно — скачки развития по неделям (от ПДР, если она указана).
+        </p>
+        <p className="hint">
+          Это не диагностика и не предсказание вашего ребёнка конкретно —
+          общие ориентиры для интереса и повод спросить педиатра, если
+          что-то настораживает. Разброс нормы в этом возрасте огромный:
+          например, самостоятельная ходьба считается нормативной вплоть
+          до 17–18 месяцев.
+        </p>
+      </InfoSection>
+    </>
+  );
+}
+
+/** Простая иконка шестерёнки — без внешних зависимостей и SVG-спрайтов. */
+function GearIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <circle cx="12" cy="12" r="3.2" />
+      <path d="M19.4 13a7.5 7.5 0 0 0 0-2l2-1.4-2-3.4-2.3.8a7.7 7.7 0 0 0-1.7-1L15 3H9l-.4 2.4a7.7 7.7 0 0 0-1.7 1l-2.3-.8-2 3.4L4.6 11a7.5 7.5 0 0 0 0 2l-2 1.4 2 3.4 2.3-.8a7.7 7.7 0 0 0 1.7 1L9 21h6l.4-2.4a7.7 7.7 0 0 0 1.7-1l2.3.8 2-3.4-2-1.4Z" />
+    </svg>
+  );
+}
+
+/**
+ * Настройки — раньше жили вперемешку с недельной статистикой и
+ * заметками «откуда цифры», теперь собраны в одном месте: приглашение
+ * второго родителя, уведомления в Telegram и их виды, ПДР, сцеживание,
+ * число кормлений вручную, резервная копия. Всё, что МЕНЯЕТ поведение
+ * приложения, а не просто ПОКАЗЫВАЕТ его — здесь; расчёты и объяснения
+ * остаются в «Неделе», рядом с тем, на что они влияют.
+ */
+/**
+ * Кто имеет доступ к дневнику: список участников, приглашение и отзыв.
+ *
+ * Заменил прежний блок «Второй родитель», где просто показывалась
+ * ссылка с НАСТОЯЩИМ токеном семьи. У той схемы было три беды: отозвать
+ * доступ у одного человека нельзя — только сменить токен всем; сколько
+ * людей держат ссылку, неизвестно; и ссылка оставалась рабочим ключом
+ * в переписке навсегда. Здесь вместо неё одноразовый код на сутки.
+ *
+ * Список показывается и зрителю: видеть, кто ещё имеет доступ к дневнику
+ * ребёнка, — законный интерес любого участника. Приглашать и отзывать
+ * может только родитель, и это проверяет сервер, а не эта разметка.
+ */
+function Members({ state }) {
+  const token = state.auth.token;
+  const viewer = isViewer(state);
+  const [list, setList] = useState(null);
+  const [err, setErr] = useState(null);
+  const [invite, setInvite] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  const reload = useCallback(() => {
+    fetchMembers(token).then(setList, () => setErr("Не удалось получить список."));
+  }, [token]);
+
+  useEffect(reload, [reload]);
+
+  const make = async (role) => {
+    setBusy(true);
+    setErr(null);
+    try {
+      const inv = await createInvite(token, role);
+      setInvite({ ...inv, link: inviteLink(inv.code) });
+      reload();
+    } catch {
+      setErr("Не удалось создать приглашение.");
+    }
+    setBusy(false);
+  };
+
+  const drop = async (m) => {
+    if (!confirm(`Отозвать доступ${m.name ? ` у «${m.name}»` : ""}? Это устройство перестанет открывать дневник.`)) return;
+    try {
+      await revokeMember(token, m.id);
+      reload();
+    } catch (e) {
+      setErr(e.message === "last_parent"
+        ? "Это последний участник с правом записи — сначала пригласите второго."
+        : "Не удалось отозвать доступ.");
+    }
+  };
+
+  const when = (ts) => (ts ? new Date(ts).toLocaleDateString("ru-RU") : "—");
+
+  return (
+    <div className="bt-card">
+      {err && <p className="hint" style={{ marginTop: 0 }}>{err}</p>}
+
+      {list === null ? (
+        <p className="hint" style={{ marginTop: 0 }}>Загружаю…</p>
+      ) : (
+        list.map((m) => (
+          <div key={m.id} className="row" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <div style={{ flex: 1, opacity: m.revokedAt ? 0.5 : 1 }}>
+              <div>
+                {m.name || (m.role === "parent" ? "Родитель" : "Просмотр")}
+                {m.me && " · это устройство"}
+              </div>
+              <div className="hint" style={{ margin: 0 }}>
+                {m.role === "parent" ? "может менять записи" : "только просмотр"}
+                {m.revokedAt
+                  ? ` · доступ отозван ${when(m.revokedAt)}`
+                  : ` · заходил ${when(m.lastSeenAt)}`}
+              </div>
+            </div>
+            {!viewer && !m.revokedAt && !m.me && (
+              <button className="nudge" onClick={() => drop(m)}>Отозвать</button>
+            )}
+          </div>
+        ))
+      )}
+
+      {!viewer && (
+        <>
+          <p className="hint">
+            Приглашение — одноразовый код, он действует сутки и сгорает после
+            первого подключения. «Только просмотр» подойдёт бабушке с дедушкой:
+            они увидят дневник целиком, но ничего не смогут изменить.
+          </p>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button className="sact ghost" disabled={busy} onClick={() => make("parent")}>
+              Пригласить родителя
+            </button>
+            <button className="sact ghost" disabled={busy} onClick={() => make("viewer")}>
+              Пригласить для просмотра
+            </button>
+          </div>
+        </>
+      )}
+
+      {invite && (
+        <>
+          <p className="hint">
+            {invite.role === "viewer" ? "Ссылка только для просмотра" : "Ссылка с правом записи"}
+            {" · действует до "}
+            {new Date(invite.expiresAt).toLocaleString("ru-RU", { dateStyle: "short", timeStyle: "short" })}
+          </p>
+          <input className="inp" readOnly value={invite.link} onFocus={(e) => e.target.select()} />
+          <button className="sact ghost full" onClick={async () => {
+            try {
+              if (navigator.share) await navigator.share({ url: invite.link, title: "Дневник сна" });
+              else await navigator.clipboard.writeText(invite.link);
+              setCopied(true);
+              setTimeout(() => setCopied(false), 2500);
+            } catch { /* пользователь отменил */ }
+          }}>
+            {copied ? "Скопировано" : "Поделиться ссылкой"}
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Разрешение на локальные уведомления.
+ *
+ * Спрашивается по нажатию, а не само при первом запуске. Системный
+ * запрос, вылетевший без объяснения, чаще всего получает отказ — а
+ * отказ на Android повторно уже не спросишь, только через настройки
+ * системы. Поэтому сначала текст, потом кнопка.
+ *
+ * В вебе плагина нет, и раздел просто не показывается: объяснять
+ * отсутствие того, чего человек не просил, незачем.
+ */
+function LocalNotifySetting() {
+  const [state, setState] = useState("loading"); // loading | absent | granted | denied
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      if (!(await localNotify.available())) { alive && setState("absent"); return; }
+      const ok = await localNotify.permissionGranted();
+      alive && setState(ok ? "granted" : "denied");
+    })();
+    return () => { alive = false; };
+  }, []);
+
+  if (state === "loading" || state === "absent") return null;
+
+  return (
+    <div className="bt-card">
+      {state === "granted" ? (
+        <p className="hint" style={{ marginTop: 0, marginBottom: 0 }}>
+          Уведомление о начале окна сна придёт на этот телефон. Оно считается
+          прямо здесь, поэтому работает и без интернета — в отличие от
+          сообщений в Telegram, которые шлёт сервер.
+        </p>
+      ) : (
+        <>
+          <p className="hint" style={{ marginTop: 0 }}>
+            Приложение может само напомнить, когда подойдёт окно сна — без
+            Telegram и без интернета, расчёт идёт на телефоне.
+          </p>
+          <button className="sact ghost full" onClick={async () => {
+            setState(await localNotify.requestPermission() ? "granted" : "denied");
+          }}>
+            Разрешить уведомления
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Скачивание резервной копии. Одна кнопка, два разных пути.
+ *
+ * В ВЕБЕ — как раньше, файл собирается на месте и отдаётся
+ * blob-ссылкой. Работает даже без связи с сервером: данные и так лежат
+ * в телефоне.
+ *
+ * В АВТОНОМНОМ APK blob-ссылка не работает в принципе: Android WebView
+ * не обрабатывает такие ссылки без отдельного DownloadListener, и
+ * кнопка молча ничего не делала. Поэтому там приложение просит у
+ * сервера одноразовую ссылку и открывает её ВНЕШНЕ — Capacitor отдаёт
+ * внешние адреса системному браузеру, а тот качает файл как любой
+ * другой. Нативного кода не нужно вовсе, что здесь особенно ценно.
+ *
+ * Почему это лучше отправки в Telegram (она осталась рядом, как второй
+ * способ): не зависит от доступности мессенджера и от того, привязан
+ * ли чат, а файл попадает сразу в «Загрузки».
+ *
+ * Цена: в APK нужен доступ к серверу. Офлайн там остаётся Telegram —
+ * тоже недоступный офлайн. Полностью автономного способа сохранить
+ * копию из APK пока нет, и это честное ограничение.
+ */
+function BackupDownload({ state }) {
+  const [msg, setMsg] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const save = async () => {
+    setMsg(null);
+    if (!BUNDLED) {
+      const blob = new Blob(
+        [JSON.stringify({ profile: state.profile, events: state.events }, null, 1)],
+        { type: "application/json" }
+      );
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `sleep-${new Date().toISOString().slice(0, 10)}.json`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      return;
+    }
+    setBusy(true);
+    try {
+      const url = await exportLink(state.auth.token);
+      // _blank — Capacitor уводит внешний адрес в системный браузер
+      window.open(url, "_blank");
+      setMsg("Открыл ссылку в браузере — файл скачается туда же, куда обычно.");
+    } catch {
+      setMsg("Не удалось получить ссылку. Нужен доступ к серверу.");
+    }
+    setBusy(false);
+  };
+
+  return (
+    <>
+      <button className="sact ghost full" disabled={busy} onClick={save}>
+        {busy ? "Готовлю…" : "Скачать резервную копию"}
+      </button>
+      {msg && <p className="hint" style={{ marginBottom: 0 }}>{msg}</p>}
+    </>
+  );
+}
+
+/**
+ * Резервная копия через Telegram.
+ *
+ * В автономном APK кнопка «скачать» не работает и работать не может:
+ * WebView не обрабатывает blob-ссылки без отдельного DownloadListener,
+ * так что нажатие молча ничего не делало. Файл уходит в привязанный
+ * чат — оттуда он доступен с любого устройства и никуда не денется.
+ *
+ * Копию собирает СЕРВЕР из своей базы, а не клиент из своей: копия
+ * должна отражать то, что реально сохранено. Иначе она способна
+ * подтвердить сохранность того, чего на сервере нет.
+ */
+function BackupToTelegram({ token }) {
+  const [state, setState] = useState("idle"); // idle | busy | done | error
+  const [msg, setMsg] = useState(null);
+
+  return (
+    <>
+      <button className="sact ghost full" disabled={state === "busy"} onClick={async () => {
+        setState("busy");
+        setMsg(null);
+        try {
+          const r = await exportToTelegram(token);
+          setState("done");
+          setMsg(`Отправлено · ${(r.bytes / 1024).toFixed(0)} КБ`);
+        } catch (e) {
+          setState("error");
+          setMsg(e.message === "no_chat"
+            ? "Сначала подключите Telegram в разделе «Неделя»."
+            : e.message === "telegram_disabled"
+            ? "Бот не настроен на сервере."
+            : "Не удалось отправить.");
+        }
+      }}>
+        {state === "busy" ? "Отправляю…" : "Прислать копию в Telegram"}
+      </button>
+      {msg && <p className="hint" style={{ marginBottom: 0 }}>{msg}</p>}
+    </>
+  );
+}
+
+function SettingsSheet({ state, events, update, onClose }) {
+  const [tgLink, setTgLink] = useState(null);
+  const [tgErr, setTgErr] = useState(false);
+
+  useEffect(() => {
+    fetchTelegramLink(state.auth.token).then(
+      (url) => (url ? setTgLink(url) : setTgErr(true)),
+      () => setTgErr(true)
+    );
+  }, [state.auth.token]);
+
+  const { dueAt } = state.profile;
+  const [dueRaw, setDueRaw] = useState(dueAt ? toInput(dueAt) : "");
+  const setDue = (iso) =>
+    update((st) => ({
+      ...st,
+      profile: { ...st.profile, dueAt: iso ? noonOf(iso) : null, updatedAt: Date.now() },
+      profileDirty: true,
+    }));
+
+  const manual = state.feedsPerDay ?? null;
+  const pumpMl = state.pumpMl ?? null;
+  const [pumpRaw, setPumpRaw] = useState(pumpMl ? String(pumpMl) : "");
+  const setFeeds = (v) => update((st) => ({ ...st, feedsPerDay: v }));
+  const setPump = (v) => update((st) => ({ ...st, pumpMl: v }));
+
+  return (
+    <div className="sheet-bg" onClick={onClose}>
+      <div className="sheet settings-sheet" onClick={(e) => e.stopPropagation()}>
+        <h3>Настройки</h3>
+
+        <div className="sec" style={{ marginTop: 0 }}>Уведомления на телефоне</div>
+        <LocalNotifySetting />
+
+        <div className="sec" style={{ marginTop: 0 }}>Кто имеет доступ</div>
+        <Members state={state} />
+
+        <div className="sec">Уведомления в Telegram</div>
+        <div className="bt-card">
+          <p className="hint" style={{ marginTop: 0 }}>
+            Бот пришлёт сообщение по тому же расчёту, что показан на вкладке
+            «Сейчас». Откройте ссылку в Telegram на телефоне каждого родителя,
+            кто хочет получать напоминания.
+          </p>
+          <NotifyPrefs state={state} update={update} />
+          {tgLink ? (
+            <a className="sact ghost full" href={tgLink} target="_blank" rel="noreferrer">
+              Открыть бота
+            </a>
+          ) : tgErr ? (
+            <p className="hint">Бот сейчас недоступен — попробуйте позже.</p>
+          ) : (
+            <p className="hint">Загружаю ссылку…</p>
+          )}
+        </div>
+
+        <div className="sec">ПДР</div>
+        <div className="bt-card">
+          <div className="field">
+            <span className="field-l">Если знаете</span>
+            <div className="field-c">
+              <input className="inp" type="date" value={dueRaw}
+                onChange={(e) => { setDueRaw(e.target.value); setDue(e.target.value || null); }} />
+              {dueAt && (
+                <button className="linkish" onClick={() => { setDueRaw(""); setDue(null); }}>Убрать</button>
+              )}
+            </div>
+          </div>
+          <p className="hint" style={{ marginTop: 0 }}>
+            Влияет только на скачки развития — точнее для родившихся не
+            в срок. Ежемесячные вехи навыков всегда считаются от даты
+            рождения.
+          </p>
+        </div>
+
+        <div className="sec">Кормления</div>
+        <div className="bt-card">
+          <div className="field">
+            <span className="field-l">Кормлений в сутки вручную</span>
+            <div className="field-c">
+              <button className="nudge" onClick={() => setFeeds(Math.max((manual ?? 8) - 1, 3))}>−1</button>
+              <span className="field-v bt-num">{manual ?? "авто"}</span>
+              <button className="nudge" onClick={() => setFeeds(Math.min((manual ?? 8) + 1, 20))}>+1</button>
+            </div>
+          </div>
+          {manual != null && (
+            <button className="linkish" onClick={() => setFeeds(null)}>Вернуть автоматическое</button>
+          )}
+          <p className="hint">
+            Если знаете фактическое число кормлений — расчёт объёма пойдёт
+            по нему, а не по медиане за полные дни.
+          </p>
+
+          <div className="field">
+            <span className="field-l">Утреннее сцеживание, 1 грудь, мл</span>
+            <div className="field-c">
+              <input
+                className="inp pump-in" inputMode="decimal" placeholder="мл"
+                value={pumpRaw}
+                onChange={(e) => setPumpRaw(e.target.value.replace(",", "."))}
+                onBlur={() => {
+                  const v = Number(pumpRaw);
+                  setPump(Number.isFinite(v) && v > 0 ? Math.round(v) : null);
+                  if (!(Number.isFinite(v) && v > 0)) setPumpRaw("");
+                }}
+              />
+              {pumpMl && (
+                <button className="linkish" onClick={() => { setPump(null); setPumpRaw(""); }}>Убрать</button>
+              )}
+            </div>
+          </div>
+          <p className="hint">
+            Заполнено — объём кормления считается прямо от этой цифры, а не
+            от суточного бюджета. Помпа обычно извлекает меньше, чем
+            эффективно сосущий ребёнок, а утренняя выработка обычно самая
+            высокая за сутки — подробности и оговорки смотрите в «Неделе».
+          </p>
+        </div>
+
+        <div className="sec">Как считается</div>
+        <HowItWorks state={state} events={events} />
+
+        <div className="sec">Данные</div>
+        <div className="bt-card">
+          <BackupDownload state={state} />
+          <BackupToTelegram token={state.auth.token} />
+        </div>
+
+        <div className="sheet-act">
+          <button className="sact ghost" onClick={onClose}>Готово</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function NotifyPrefs({ state, update }) {
+  const off = state.profile?.notifyOff || [];
+  const toggle = (kind) =>
+    update((st) => {
+      const cur = st.profile?.notifyOff || [];
+      const next = cur.includes(kind) ? cur.filter((k) => k !== kind) : [...cur, kind];
+      return {
+        ...st,
+        profile: { ...st.profile, notifyOff: next, updatedAt: Date.now() },
+        profileDirty: true,
+      };
+    });
+
+  return (
+    <div className="nprefs">
+      {NOTIFY_KINDS.map(([kind, label, hint]) => {
+        const on = !off.includes(kind);
+        return (
+          <div className="npref" key={kind}>
+            <button
+              className={"npref-b" + (on ? " on" : "")}
+              onClick={() => toggle(kind)}
+              role="switch"
+              aria-checked={on}
+            >
+              <span className="npref-l">{label}</span>
+              <span className="npref-s">{on ? "включено" : "выключено"}</span>
+            </button>
+            <p className="hint" style={{ marginTop: 6 }}>{hint}</p>
+          </div>
+        );
+      })}
+      {off.length === NOTIFY_KINDS.length && (
+        <p className="hint">
+          Выключено всё — бот останется привязанным, но писать не будет.
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Насколько прогноз попадает. Раньше этого числа не было и быть
+ * не могло: окно расширялось вслед за разбросом, то есть всегда
+ * «почти попадало». Ширина теперь постоянная, промах виден — значит
+ * его надо показывать, а не прятать.
+ */
+function QualityCard({ state, events }) {
+  const { profile } = state;
+  const now = Date.now();
+  const scores = sourceScores(events, profile.birth, now);
+  const pick = pickSource(events, profile.birth, now);
+
+  if (!scores) {
+    return (
+      <div className="bt-card">
+        <p className="hint" style={{ marginTop: 0 }}>
+          Наберётся несколько дневных снов — покажу, какой источник прогноза
+          точнее на вашем ребёнке.
+        </p>
+      </div>
+    );
+  }
+
+  const best = Math.min(...scores.map((r) => r.miss));
+
+  return (
+    <div className="bt-card">
+      <div className="srcs">
+        <div className="src-h">
+          <span>источник</span>
+          <span className="bt-num">попаданий</span>
+          <span className="bt-num">промах</span>
+        </div>
+        {scores.map((r) => (
+          <div className={"src-r" + (r.key === pick.key ? " on" : "")} key={r.key}>
+            <span>{r.label}</span>
+            <span className="bt-num">{r.hits}/{r.n}</span>
+            <span className="bt-num">{r.miss} мин</span>
+          </div>
+        ))}
+      </div>
+      <p className="hint">
+        Сейчас работает <b>{sourceLabel(pick.key)}</b> — тот из трёх
+        источников, что промахивался меньше на последних {scores[0].n} снах.
+        Сравнение идёт по последним {PICK_TAIL} снам, и этого мало: на такой
+        выборке отрыв в 10 минут и меньше — случайность, он гуляет от сна
+        к сну. Значим только крупный и устойчивый разрыв. На всей истории
+        дневника поправки обычно опережают голые таблицы заметно сильнее,
+        чем видно здесь. Подробности — в настройках ⚙️.
+      </p>
+    </div>
+  );
+}
+
+/** Что именно приложение считает про кормления и на каких числах. */
+function FeedModelCard({ state, events }) {
+  const { birth, sex } = state.profile;
+  const manual = state.feedsPerDay ?? null;
+  const pumpMl = state.pumpMl ?? null;
+  const t = perFeedMl(events, birth, sex || null, Date.now(), manual, pumpMl);
+  const p = predictFeed(events, birth, sex || null, Date.now(), manual, pumpMl);
+
+  if (!t) {
+    return (
+      <div className="bt-card">
+        <p className="hint" style={{ marginTop: 0 }}>
+          Чтобы считать объём кормления, нужен вес: укажите пол на вкладке
+          «Вес» или запишите взвешивание.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="bt-card">
+      <div className="field">
+        <span className="field-l">Суточный объём по возрасту</span>
+        <span className="field-v bt-num">{Math.round(t.daily)} мл</span>
+      </div>
+      <div className="field">
+        <span className="field-l">Кормлений в сутки</span>
+        <span className="field-v bt-num">{t.feeds}</span>
+      </div>
+      <p className="hint" style={{ marginTop: 0 }}>
+        {manual
+          ? "Значение задано вручную, в настройках ⚙️."
+          : "Медиана по полным дням. Знаете фактическое число — задайте в настройках ⚙️."}
+      </p>
+      {pumpMl && (
+        <p className="hint" style={{ marginTop: 0 }}>
+          Указано сцеживание одной груди утром — {pumpMl} мл. Объём кормления
+          считается прямо от этой цифры, а не от суточного бюджета. Изменить
+          или убрать — в настройках ⚙️.
+        </p>
+      )}
+      <div className="field">
+        <span className="field-l">Отсюда объём кормления</span>
+        <span className="field-v bt-num">≈{Math.round(t.ml)} мл</span>
+      </div>
+      {t.pumpBased && (
+        <p className="hint">
+          Для сравнения: без сцеживания, по суточному бюджету и числу
+          кормлений, получилось бы ≈{Math.round(t.computedMl)} мл.
+        </p>
+      )}
+      {p && !p.empty && p.interval != null && (
+        <div className="field">
+          <span className="field-l">Свой промежуток между кормлениями</span>
+          <span className="field-v bt-num">{Math.round(p.interval)} мин</span>
+        </div>
+      )}
+
+      <p className="hint">
+        Приложение считает не голод, а освободился ли желудок — поэтому
+        везде «можно кормить», а не «пора». Как именно считается —
+        в настройках ⚙️, раздел «Как считается».
+      </p>
+    </div>
+  );
+}
+
+/**
+ * Состояние кормления на вкладке «Сейчас».
+ *
+ * Формулировки намеренно разрешительные: «можно», а не «пора».
+ * Приложение не знает, голоден ли ребёнок, — оно знает только,
+ * освободился ли желудок. Кормление по требованию этим подменять
+ * нельзя, и сигналы ребёнка точнее любого расчёта.
+ */
+function FeedNote({ events, profile, now, feedsPerDay, pumpMl }) {
+  const nowMin = Math.floor(now / 60000) * 60000;
+  const p = useMemo(
+    () => predictFeed(events, profile.birth, profile.sex || null, nowMin, feedsPerDay, pumpMl),
+    [events, profile.birth, profile.sex, nowMin, feedsPerDay, pumpMl]
+  );
+  if (!p) return null;
+
+  if (p.empty) {
+    return (
+      <div className="bt-card feed" style={{ marginTop: 12 }}>
+        <div className="feed-t">Кормления</div>
+        <p className="hint" style={{ marginTop: 6 }}>
+          Отметьте хотя бы одно кормление — дальше приложение будет считать,
+          когда желудок освободится.
+        </p>
+      </div>
+    );
+  }
+
+  const pct = Math.round(p.fill * 100);
+
+  return (
+    <div className="bt-card feed" style={{ marginTop: 12 }}>
+      <div className="feed-head">
+        <span className="feed-t">
+          {p.asleep
+            ? "Спит — кормление подождёт"
+            : p.readyNow
+            ? "Можно кормить"
+            : `Можно кормить с ${hhmm(p.readyAt)}`}
+        </span>
+        <span className="feed-pct bt-num">{pct}%</span>
+      </div>
+      <div className="feed-bar">
+        <div className="feed-fill" style={{ width: `${pct}%` }} />
+        <div className="feed-mark" style={{ left: `${Math.round(READY_FRACTION * 100)}%` }} />
+      </div>
+      <div className="win-text bt-num" style={{ marginTop: 8 }}>
+        Последнее кормление в {hhmm(p.lastFeed.start)} · {durShort(p.gapMin * MIN)} назад
+      </div>
+
+      {p.stale ? (
+        <p className="hint">
+          Прошло {durShort(p.gapMin * MIN)}, и почти всё это время ребёнок не спал.
+          Похоже, кормления просто не отмечены — напоминание в этом случае
+          не приходит, чтобы не будить вас из-за дырки в дневнике. Отметьте
+          ближайшее кормление, и расчёт восстановится за пару часов.
+        </p>
+      ) : p.nightly ? (
+        <p className="hint">
+          Следующее напоминание пришлось бы на ночь — ночью приложение
+          не пишет. Ночные кормления по требованию и без подсказок.
+        </p>
+      ) : p.asleep ? (
+        <p className="hint">
+          Пока ребёнок спит, напоминание о кормлении не придёт: будить его
+          пушем — худшее, что приложение может сделать.
+        </p>
+      ) : (
+        <p className="hint">
+          {p.readyNow
+            ? "Желудок освободился. Это не значит «пора» — это значит, что ребёнок сейчас скорее возьмёт, чем откажется."
+            : `Сейчас в желудке примерно ${Math.round(p.level)} мл. Раньше этого времени ребёнок, скорее всего, возьмёт меньше обычного.`}
+          {" "}Напоминание в Telegram — в {hhmm(p.dueAt)}.
+        </p>
+      )}
+    </div>
+  );
+}
+
+/* ================================================================== */
+/*  Антропометрия: вес, длина, окружность головы                       */
+/* ================================================================== */
+
+/**
+ * Кривые ВОЗ и точки ребёнка. Один компонент на все три показателя:
+ * различаются они только таблицей, единицами и шагом сетки, а это
+ * всё лежит в описании показателя (IND).
+ *
+ * Рисуется по узлам без сглаживания: кривые ВОЗ и так гладкие, а
+ * ломаная по 64 точкам на экране телефона неотличима от гладкой.
+ */
+function GrowthChart({ ind, sex, points, ageDays }) {
+  const W = 340, H = 208, padL = 30, padR = 26, padT = 10, padB = 20;
+  const lastDay = points.length ? points[points.length - 1].days : 0;
+  const top = maxDays(ind);
+  const xMax = Math.min(top, Math.max(120, ageDays * 1.15, lastDay + 10));
+
+  const N = 64;
+  const xs = Array.from({ length: N + 1 }, (_, i) => (xMax * i) / N);
+  const zLines = [-3, -2, -1, 0, 1, 2, 3];
+  const curves = zLines.map((z) => xs.map((d) => valueAt(ind, sex, d, z)));
+
+  let yLo = Math.min(...curves[0]);
+  let yHi = Math.max(...curves[6]);
+  for (const p of points) {
+    if (p.days < 0 || p.days > xMax) continue;
+    yLo = Math.min(yLo, p.value);
+    yHi = Math.max(yHi, p.value);
+  }
+  const pad = (yHi - yLo) * 0.04;
+  yLo -= pad;
+  yHi += pad;
+
+  const x = (d) => padL + (d / xMax) * (W - padL - padR);
+  const y = (v) => H - padB - ((v - yLo) / (yHi - yLo)) * (H - padT - padB);
+
+  const pt = (vals) => vals.map((v, i) => `${x(xs[i])},${y(v)}`);
+  const line = (vals) => pt(vals).join(" ");
+  /** Полоса между двумя кривыми: туда по верхней, обратно по нижней. */
+  const band = (lo, hi) =>
+    `M ${pt(curves[hi]).join(" L ")} L ${pt(curves[lo]).reverse().join(" L ")} Z`;
+
+  const yStep = ind.ticks(yHi - yLo);
+  const yTicks = [];
+  for (let v = Math.ceil(yLo / yStep) * yStep; v <= yHi; v += yStep) yTicks.push(v);
+
+  const mStep = xMax <= 200 ? 1 : xMax <= 400 ? 2 : xMax <= 800 ? 3 : 6;
+  const xTicks = [];
+  for (let m = 0; m * DAYS_PER_MONTH <= xMax; m += mStep) xTicks.push(m);
+
+  const own = points.filter((p) => p.days >= 0 && p.days <= xMax);
+
+  return (
+    <svg className="chart" viewBox={`0 0 ${W} ${H}`} role="img"
+      aria-label={`${ind.title} относительно стандартов ВОЗ`}>
+      <path d={band(0, 6)} fill="rgba(108,123,217,.07)" />
+      <path d={band(1, 5)} fill="rgba(108,123,217,.11)" />
+
+      {yTicks.map((v) => (
+        <g key={v}>
+          <line x1={padL} x2={W - padR} y1={y(v)} y2={y(v)} stroke="#2b2739" strokeWidth="0.5" />
+          <text x={padL - 4} y={y(v) + 3} textAnchor="end" fontSize="8" fill="#5d5670">{v}</text>
+        </g>
+      ))}
+      {xTicks.map((m) => (
+        <text key={m} x={x(m * DAYS_PER_MONTH)} y={H - 6} textAnchor="middle"
+          fontSize="8" fill="#5d5670">{m}</text>
+      ))}
+
+      {zLines.map((z, i) => (
+        <polyline key={z} points={line(curves[i])} fill="none"
+          stroke={z === 0 ? "#6c7bd9" : "#3c3757"}
+          strokeWidth={z === 0 ? 1 : 0.7}
+          strokeDasharray={z === 0 ? "3 3" : undefined} />
+      ))}
+      {[[5, "+2"], [3, "0"], [1, "−2"]].map(([i, lab]) => (
+        <text key={lab} x={W - padR + 3} y={y(curves[i][N]) + 3} fontSize="8" fill="#6f677f">
+          {lab}
+        </text>
+      ))}
+
+      {own.length > 1 && (
+        <polyline points={own.map((p) => `${x(p.days)},${y(p.value)}`).join(" ")}
+          fill="none" stroke={ind.color} strokeWidth="1.6"
+          strokeLinejoin="round" strokeLinecap="round" />
+      )}
+      {own.map((p, i) => (
+        <circle key={p.id} cx={x(p.days)} cy={y(p.value)} r={i === own.length - 1 ? 3.2 : 2}
+          fill={i === own.length - 1 ? ind.color : "#14121c"}
+          stroke={ind.color} strokeWidth="1.4" />
+      ))}
+    </svg>
+  );
+}
+
+/**
+ * Вкладка одного показателя: вес, длина тела или окружность головы.
+ * Кривые — WHO Child Growth Standards (weight-for-age,
+ * length-for-age, head-circumference-for-age).
+ *
+ * Осознанные решения, общие для всех трёх:
+ *   - Показываются линии z-оценок (−3…+3), а не перцентильные кривые:
+ *     считаем мы всё равно z, и рисовать одно, а считать другое —
+ *     верный способ разойтись на округлениях.
+ *   - Темп прироста считается только по плечу от недели и длиннее,
+ *     иначе погрешность измерения больше самого прироста.
+ *   - Тревожная формулировка одна и мягкая. Приложение, которое
+ *     пугает родителя трёхмесячного ребёнка по показаниям кухонных
+ *     весов и сантиметровой ленты, приносит больше вреда, чем пользы.
+ */
+function MeasureView({ ind, profile, events, now, onAdd, onSex, onPick }) {
+  const [raw, setRaw] = useState("");
+  const [date, setDate] = useState(() => toInput(Date.now()));
+  const [err, setErr] = useState(null);
+
+  // при переключении вкладки поле должно очищаться, иначе введённые
+  // килограммы уедут в сантиметры соседнего показателя
+  useEffect(() => { setRaw(""); setErr(null); }, [ind.key]);
+
+  const sex = profile.sex || null;
+  const pts = useMemo(
+    () => measurements(ind, events, profile.birth),
+    [ind, events, profile.birth]
+  );
+  const ageDays = (now - profile.birth) / DAY;
+  const last = pts.length ? pts[pts.length - 1] : null;
+  const lastZ = sex && last && inRange(ind, last.days)
+    ? zOf(ind, sex, last.days, last.value) : null;
+  const gain = useMemo(() => gainRate(ind, pts, sex), [ind, pts, sex]);
+  const trend = useMemo(() => zTrend(ind, pts, sex), [ind, pts, sex]);
+
+  const submit = () => {
+    const v = parseValue(ind, raw);
+    if (v == null) {
+      setErr(`Не понял значение. Введите ${ind.unit} (${ind.key === "weight" ? "6,35" : "61,4"}) или ${ind.stepUnit} (${ind.key === "weight" ? "6350" : "614"}).`);
+      return;
+    }
+    const ts = noonOf(date);
+    if (!Number.isFinite(ts)) { setErr("Неверная дата."); return; }
+    if (ts < profile.birth - DAY) { setErr("Эта дата раньше дня рождения."); return; }
+    if (ts > Date.now() + DAY) { setErr("Дата в будущем."); return; }
+    onAdd(ind, v, ts);
+    setRaw("");
+    setErr(null);
+  };
+
+  if (!sex) {
+    return (
+      <>
+        <div className="sec" style={{ marginTop: 0 }}>Пол ребёнка</div>
+        <div className="bt-card">
+          <p className="hint" style={{ marginTop: 0 }}>
+            Кривые роста у мальчиков и девочек разные — к трём месяцам медианы
+            расходятся сильнее, чем весь разброс, который вы будете
+            отслеживать. Без пола график строить нечестно.
+          </p>
+          <div className="settle-row" style={{ marginTop: 12 }}>
+            {["f", "m"].map((k) => (
+              <button key={k} className="settle-b" onClick={() => onSex(k)}>
+                {SEX_LABEL[k]}
+              </button>
+            ))}
+          </div>
+          <p className="hint">
+            Значение уедет в профиль дневника и появится на втором телефоне
+            при ближайшей синхронизации.
+          </p>
+        </div>
+      </>
+    );
+  }
+
+  const outOfRange = !inRange(ind, ageDays);
+
+  return (
+    <>
+      <div className="sec" style={{ marginTop: 0 }}>Записать {ind.what}</div>
+      <div className="bt-card">
+        <div className="wrow">
+          <input className="inp wrow-w" value={raw} inputMode="decimal"
+            placeholder={`${ind.unit}, например ${ind.key === "weight" ? "6,35" : "61,4"}`}
+            onChange={(e) => { setRaw(e.target.value); setErr(null); }}
+            onKeyDown={(e) => e.key === "Enter" && submit()} />
+          <input className="inp wrow-d" type="date" value={date} max={toInput(Date.now())}
+            onChange={(e) => { setDate(e.target.value); setErr(null); }} />
+        </div>
+        {err && <p className="hint err">{err}</p>}
+        <button className="big sleep" onClick={submit}>Записать</button>
+        <p className="hint">{MEASURE_HINT[ind.key]}</p>
+      </div>
+
+      <div className="sec">График</div>
+      <div className="bt-card">
+        <GrowthChart ind={ind} sex={sex} points={pts} ageDays={ageDays} />
+        <div className="chart-cap">
+          <span>месяцы</span>
+          <span>{ind.unit} · линии ВОЗ: −3 … 0 … +3 SD</span>
+        </div>
+        {pts.length === 0 && (
+          <p className="hint">
+            Записей пока нет — показаны только кривые ВОЗ для {SEX_GEN[sex]}.
+            {ind.key === "weight" && " Первой точкой удобно поставить вес при рождении: выберите дату рождения в поле выше."}
+          </p>
+        )}
+        {outOfRange && (
+          <p className="hint">
+            Таблица ВОЗ по этому показателю заканчивается
+            на {ind.maxMonths === 24 ? "двух годах" : "пяти годах"}
+            {ind.key === "length" && " — после двух лет рост измеряют стоя, и это уже другая величина"}.
+            Записи сохраняются, перцентиль дальше не считается.
+          </p>
+        )}
+      </div>
+
+      {last && (
+        <>
+          <div className="sec">Последнее {ind.what}</div>
+          <div className="kpi">
+            <div>
+              <div className="kpi-v bt-num">{valueText(ind, last.raw)}</div>
+              <div className="kpi-l">{ind.unit} · {dayLabel(last.ts)}</div>
+            </div>
+            <div>
+              <div className="kpi-v bt-num">{lastZ == null ? "—" : pctText(lastZ)}</div>
+              <div className="kpi-l">перцентиль</div>
+            </div>
+            <div>
+              <div className="kpi-v bt-num">
+                {inRange(ind, last.days)
+                  ? medianOf(ind, sex, last.days).toFixed(ind.key === "weight" ? 2 : 1).replace(".", ",")
+                  : "—"}
+              </div>
+              <div className="kpi-l">медиана ВОЗ на тот возраст</div>
+            </div>
+            <div>
+              <div className="kpi-v bt-num">
+                {gain ? `${gain.perWeek > 0 ? "+" : ""}${Math.round(gain.perWeek)}` : "—"}
+              </div>
+              <div className="kpi-l">{ind.stepUnit === "граммы" ? "г" : "мм"} в неделю</div>
+            </div>
+          </div>
+
+          {lastZ != null && (
+            <p className="hint">
+              Из ста детей того же возраста и пола примерно <b>{pctText(lastZ)}</b> имеют
+              значение меньше{Math.abs(lastZ) > 3 ? " (у самого края таблицы это уже грубая оценка)" : ""}.
+              Сам по себе перцентиль ничего не значит: тридцатый — такая же норма,
+              как семидесятый. Значение имеет только то, держится он или ползёт.
+            </p>
+          )}
+
+          {gain && (
+            <p className="hint">
+              С {dayLabel(gain.from.ts)} по {dayLabel(gain.to.ts)} ({Math.round(gain.days)} дн)
+              прирост <b>{gain.delta > 0 ? "+" : ""}{gain.delta} {ind.stepUnit === "граммы" ? "г" : "мм"}</b>,
+              это <b>{Math.round(gain.perWeek)} {ind.stepUnit === "граммы" ? "г" : "мм"} в неделю</b>.
+              {gain.refPerWeek != null && (
+                <> Медиана ВОЗ за тот же отрезок растёт
+                на {Math.round(gain.refPerWeek)} {ind.stepUnit === "граммы" ? "г" : "мм"} в неделю.</>
+              )}{" "}
+              Это разность медиан, а не отдельный стандарт скорости прироста —
+              такой у ВОЗ есть, считается иначе и по коротким отрезкам обычно
+              шире. Сравнивайте порядок величины, а не единицы.
+            </p>
+          )}
+          {!gain && pts.length >= 2 && (
+            <p className="hint">
+              Темп прироста посчитается, когда между измерениями наберётся
+              {" "}{GAIN_MIN_DAYS} дней. На более коротком плече погрешность измерения
+              больше самого прироста, и цифра будет случайной.
+            </p>
+          )}
+
+          {ind.key === "weight" && ageDays < 21 && (
+            <p className="hint">
+              Первые дни ребёнок теряет вес — до 7–10 % от веса при рождении,
+              и возвращается к нему обычно к 10–14 дню. На графике это выглядит
+              как провал вниз по кривым, и это ожидаемо. Смотреть на коридор
+              имеет смысл после трёх недель.
+            </p>
+          )}
+
+          {trend && trend.shift >= Z_DROP_ALARM && trend.span >= 14 && (
+            <div className="bt-card sick" style={{ marginTop: 12 }}>
+              <div className="sick-t">
+                Коридор сместился {trend.dir === "up" ? "вверх" : "вниз"}
+              </div>
+              <p className="hint" style={{ marginTop: 6 }}>
+                С {dayLabel(trend.from.ts)} перцентиль {trend.dir === "up" ? "поднялся" : "опустился"}
+                {" "}с {pctText(trend.from.z)} до {pctText(trend.last.z)}. Смещение
+                на такую величину — повод показать цифры педиатру на ближайшем
+                приёме, а не повод для выводов: его может дать и другая техника
+                измерения, и просто индивидуальная траектория. Приложение ничего
+                не диагностирует.
+              </p>
+            </div>
+          )}
+        </>
+      )}
+
+      <div className="sec">Все записи</div>
+      <div className="bt-card list">
+        {pts.length === 0 ? (
+          <div className="empty">Записей нет.</div>
+        ) : (
+          pts.slice().reverse().map((p) => {
+            const z = inRange(ind, p.days) ? zOf(ind, sex, p.days, p.value) : null;
+            return (
+              <button className="row" key={p.id}
+                onClick={() => onPick(events.find((e) => e.id === p.id))}>
+                <span className="dot" style={{ background: ind.color }} />
+                <span className="row-main">
+                  <span className="row-t">{valueText(ind, p.raw)} {ind.unit}</span>
+                  <span className="row-s bt-num">
+                    {dayLabel(p.ts)} · {ageText(profile.birth, p.ts)}
+                  </span>
+                </span>
+                <span className="row-r bt-num">{z == null ? "—" : `${pctText(z)}-й`}</span>
+              </button>
+            );
+          })
+        )}
+      </div>
+      <p className="hint">Нажмите на запись, чтобы поправить значение или дату.</p>
+
+      <div className="bt-card">
+        <p className="hint" style={{ marginTop: 0 }}>
+          Кривые — стандарты ВОЗ (2006) для {SEX_GEN[sex]}.{" "}
+          <button className="linkish" onClick={() => onSex(sex === "m" ? "f" : "m")}>
+            Изменить пол
+          </button>
+        </p>
+        <p className="hint">
+          {ind.key === "weight"
+            ? "Взвешивайте раз в неделю-две: разброс между двумя измерениями подряд сопоставим с недельной прибавкой."
+            : "Домашние измерения здесь неточны — цифрам с приёма доверяйте больше. Как считается — в настройках ⚙️."}
+        </p>
+      </div>
+    </>
+  );
+}
+
+/**
+ * Три кнопки «как прошло укладывание». Необязательны: без метки
+ * расчёт работает как раньше. Повторный тап по выбранной снимает её.
+ */
+function SettlePicker({ value, onPick, hint }) {
+  return (
+    <div className="settle">
+      <div className="settle-l">Что-то пошло не так?</div>
+      <div className="settle-row settle-row-3">
+        {SETTLE_KINDS.map((k) => (
+          <button
+            key={k}
+            className={"settle-b" + (value === k ? " on" : "")}
+            onClick={() => onPick(k)}
+            title={SETTLE_HINT[k]}
+          >
+            {SETTLE_LABEL[k]}
+          </button>
+        ))}
+      </div>
+      {value && <p className="hint" style={{ marginTop: 8 }}>{SETTLE_HINT[value]}</p>}
+      {!value && hint && <p className="hint" style={{ marginTop: 8 }}>{hint}</p>}
+    </div>
+  );
+}
+
+function EditSheet({ ev, nights, onShift, onMl, onSeconds, onValue, onDays, onNight, onSettle, onClose, onDelete }) {
+  const ind = IND[ev.type];
+  if (ind) {
+    const [small, big] = ind.steps;
+    return (
+      <div className="sheet-bg" onClick={onClose}>
+        <div className="sheet" onClick={(e) => e.stopPropagation()}>
+          <h3>{ind.title}</h3>
+          <div className="field">
+            <span className="field-l">Дата</span>
+            <div className="field-c">
+              <button className="nudge" onClick={() => onDays(-1)}>−1 д</button>
+              <span className="field-v bt-num">{dayLabel(ev.start)}</span>
+              <button className="nudge" onClick={() => onDays(1)}>+1 д</button>
+            </div>
+          </div>
+          <div className="field">
+            <span className="field-l">Значение, {ind.unit}</span>
+            <div className="field-c">
+              <button className="nudge" onClick={() => onValue(-big)}>−{big}</button>
+              <button className="nudge" onClick={() => onValue(-small)}>−{small}</button>
+              <span className="field-v bt-num">
+                {valueText(ind, ev.meta?.[ind.metaKey] || 0)}
+              </span>
+              <button className="nudge" onClick={() => onValue(small)}>+{small}</button>
+              <button className="nudge" onClick={() => onValue(big)}>+{big}</button>
+            </div>
+          </div>
+          <p className="hint">Шаг кнопок — {ind.stepUnit}.</p>
+          <div className="sheet-act">
+            <button className="sact ghost" onClick={onClose}>Готово</button>
+            <button className="sact del" onClick={onDelete}>Удалить</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="sheet-bg" onClick={onClose}>
+      <div className="sheet" onClick={(e) => e.stopPropagation()}>
+        <h3>{eventTitle(ev, nights)}</h3>
+        <Stepper label="Начало" value={hhmm(ev.start)} onChange={(m) => onShift("start", m)} />
+        {ev.type === "sleep" && (
+          <>
+            <div className="field">
+              <span className="field-l">Это</span>
+              <div className="field-c">
+                {[[false, "Дневной"], [true, "Ночной"], [null, "Авто"]].map(([v, l]) => (
+                  <button key={String(v)}
+                    className={"nudge" + ((ev.meta?.night ?? null) === v ? " on" : "")}
+                    onClick={() => onNight(v)}>{l}</button>
+                ))}
+              </div>
+            </div>
+            <p className="hint">
+              {(ev.meta?.night ?? null) === null
+                ? `Авто: ${autoNight(ev, nights) ? "ночной" : "дневной"}. Приложение решает по непрерывности — если между снами было только кормление, считает продолжением ночи.`
+                : "Ваша пометка. Она сильнее автоматики: помеченный дневным сон приложение не склеит с ночным и посчитает отдельным окном бодрствования."}
+            </p>
+          </>
+        )}
+        {ev.type === "sleep" && ev.end && (
+          <>
+            <Stepper label="Конец" value={hhmm(ev.end)} onChange={(m) => onShift("end", m)} />
+            <div className="field">
+              <span className="field-l">Длительность</span>
+              <span className="field-v bt-num">{dur(ev.end - ev.start)}</span>
+            </div>
+          </>
+        )}
+        {ev.type === "sleep" && !isNight(ev, nights) && (
+          <SettlePicker value={settleOf(ev)} onPick={onSettle} />
+        )}
+        {ev.type === "feed" && (ev.meta?.kind === "formula" || ev.meta?.kind === "ebm") && (
+          <div className="field">
+            <span className="field-l">Объём, мл</span>
+            <div className="field-c">
+              <button className="nudge" onClick={() => onMl(-10)}>−10</button>
+              <span className="field-v bt-num">{ev.meta.ml || 0}</span>
+              <button className="nudge" onClick={() => onMl(10)}>+10</button>
+            </div>
+          </div>
+        )}
+        {ev.type === "feed" && ev.meta?.kind === "breast" && (
+          <>
+            <div className="field">
+              <span className="field-l">Длительность</span>
+              <div className="field-c">
+                <button className="nudge" onClick={() => onSeconds(-60)}>−1 мин</button>
+                <span className="field-v bt-num">
+                  {Math.round((ev.meta?.sec || 0) / 60)} мин
+                </span>
+                <button className="nudge" onClick={() => onSeconds(60)}>+1 мин</button>
+              </div>
+            </div>
+            <p className="hint">
+              Объём кормления пересчитается по новой длительности — независимо
+              от того, когда именно оно началось и закончилось.
+            </p>
+          </>
+        )}
+        <div className="sheet-act">
+          <button className="sact ghost" onClick={onClose}>Готово</button>
+          <button className="sact del" onClick={onDelete}>Удалить</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Stepper({ label, value, onChange }) {
+  return (
+    <div className="field">
+      <span className="field-l">{label}</span>
+      <div className="field-c">
+        <button className="nudge" onClick={() => onChange(-15)}>−15</button>
+        <button className="nudge" onClick={() => onChange(-5)}>−5</button>
+        <span className="field-v bt-num">{value}</span>
+        <button className="nudge" onClick={() => onChange(5)}>+5</button>
+        <button className="nudge" onClick={() => onChange(15)}>+15</button>
+      </div>
+    </div>
+  );
+}
+
+/* ================================================================== */
+
+function JoinPrompt({ busy, err, count, onJoin, onSkip }) {
+  return (
+    <div className="bt">
+      <div className="bt-shell">
+        <div className="state" style={{ paddingTop: 40 }}>
+          <div className="state-label">Общий дневник</div>
+          <div className="state-time" style={{ fontSize: 30, marginTop: 10 }}>
+            Подключиться?
+          </div>
+        </div>
+        <div className="bt-card">
+          <p className="hint" style={{ marginTop: 0 }}>
+            Этот телефон подключится к дневнику по присланной ссылке.
+            {count > 0 && (
+              <> Ваши {count} записей не пропадут — они объединятся с теми,
+              что уже есть в общем дневнике.</>
+            )}
+          </p>
+          {err && <p className="hint err">{err}</p>}
+          <button className="big sleep" disabled={busy}
+            style={busy ? { opacity: 0.4 } : undefined} onClick={onJoin}>
+            {busy ? "Подключаю…" : "Подключиться"}
+          </button>
+          <button className="sact ghost full" onClick={onSkip}>
+            Не сейчас
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Onboarding({ onReady }) {
+  const joinToken = readJoinToken();
+  const [name, setName] = useState("");
+  const [date, setDate] = useState("");
+  const [sex, setSex] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const [code, setCode] = useState("");
+
+  useEffect(() => {
+    if (!joinToken) return;
+    (async () => {
+      setBusy(true);
+      try {
+        /*
+         * Код приглашения одноразовый и живёт сутки, поэтому «ссылка не
+         * подошла» здесь чаще всего значит не опечатку, а то, что ею уже
+         * воспользовались или она просрочена. Текст ошибки об этом и
+         * говорит — иначе человек будет тыкать в неё повторно.
+         */
+        const got = joinToken.kind === "code" ? await redeemInvite(joinToken.value) : null;
+        const token = got ? got.token : joinToken.value;
+
+        const res = await fetch(`${API}/sync`, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+          body: JSON.stringify({ since: 0, events: [] }),
+        });
+        if (!res.ok) throw new Error("Ссылка не подошла. Попросите прислать новую.");
+        const data = await res.json();
+        history.replaceState(null, "", import.meta.env.BASE_URL);
+        onReady({
+          profile: data.profile,
+          events: data.events.map((e) => ({ ...e, dirty: false })),
+          auth: { token, member: data.member ?? got?.member ?? null },
+          rev: data.rev,
+          bias: 0,
+          profileDirty: false,
+        });
+      } catch (e) {
+        setErr(e.message === "bad_invite"
+          ? "Приглашение уже использовано или просрочено. Попросите новое."
+          : e.message);
+        setBusy(false);
+      }
+    })();
+  }, [joinToken]);
+
+  if (joinToken && !err) return <Splash text="Подключаюсь к дневнику…" />;
+
+  const ok = name.trim() && date && sex && !busy;
+
+  /*
+   * Подключение по коду, набранному руками.
+   *
+   * Ссылка приглашения ведёт на сайт, и в обёртке Capacitor она откроется
+   * в браузере, а не в приложении: перехват ссылок требует настроенного
+   * assetlinks.json и подписи APK, то есть работает не всегда и ломается
+   * молча. Ввод кода работает всегда и везде — в том числе когда
+   * мессенджер испортил ссылку или её переслали текстом.
+   *
+   * Принимаем и голый код, и целую ссылку: человек скорее вставит то,
+   * что у него в буфере, чем станет выкусывать часть после решётки.
+   */
+  const useCode = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      const clean = code.match(/(?:invite|join)=([A-Za-z0-9_-]+)/)?.[1] || code;
+      const got = await redeemInvite(clean);
+      const res = await fetch(`${API}/sync`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${got.token}` },
+        body: JSON.stringify({ since: 0, events: [] }),
+      });
+      if (!res.ok) throw new Error("sync_failed");
+      const data = await res.json();
+      onReady({
+        profile: data.profile,
+        events: data.events.map((e) => ({ ...e, dirty: false })),
+        auth: { token: got.token, member: data.member ?? got.member ?? null },
+        rev: data.rev,
+        bias: 0,
+        profileDirty: false,
+      });
+    } catch {
+      setErr("Код не подошёл: он одноразовый и действует сутки. Попросите новый.");
+      setBusy(false);
+    }
+  };
+
+  const submit = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      const birth = new Date(date + "T09:00:00").getTime();
+      const { token, householdId } = await createHousehold(name.trim(), birth, sex);
+      onReady({
+        profile: { name: name.trim(), birth, sex, updatedAt: Date.now() },
+        events: [],
+        auth: { token, householdId },
+        rev: 0,
+        bias: 0,
+        profileDirty: false,
+      });
+    } catch (e) {
+      setErr("Сервер недоступен. Проверьте соединение и попробуйте ещё раз.");
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="bt">
+      <div className="bt-shell">
+        <div className="state" style={{ paddingTop: 40 }}>
+          <div className="state-label">Дневник сна</div>
+          <div className="state-time" style={{ fontSize: 34, marginTop: 10 }}>Начнём</div>
+        </div>
+        <div className="bt-card">
+          <label className="lab" htmlFor="n">Как зовут ребёнка</label>
+          <input id="n" className="inp" value={name} onChange={(e) => setName(e.target.value)} placeholder="Имя" />
+          <label className="lab" htmlFor="d">Дата рождения</label>
+          <input id="d" className="inp" type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+          <label className="lab">Пол</label>
+          <div className="settle-row">
+            {["f", "m"].map((k) => (
+              <button key={k} className={"settle-b" + (sex === k ? " on" : "")}
+                onClick={() => setSex(k)}>
+                {SEX_LABEL[k]}
+              </button>
+            ))}
+          </div>
+          <p className="hint">
+            Дата рождения нужна для расчёта окон бодрствования, пол — для кривых
+            веса: у мальчиков и девочек они заметно разные. Больше эти данные
+            никуда не идут.
+          </p>
+          {err && <p className="hint err">{err}</p>}
+          <button className="big sleep" disabled={!ok} style={!ok ? { opacity: 0.4 } : undefined} onClick={submit}>
+            {busy ? "Создаю…" : "Продолжить"}
+          </button>
+        </div>
+        <div className="sec">Уже есть приглашение</div>
+        <div className="bt-card">
+          <p className="hint" style={{ marginTop: 0 }}>
+            Если вам прислали ссылку, но она открылась не в приложении, введите
+            код из неё — это часть после решётки.
+          </p>
+          <input
+            className="inp"
+            value={code}
+            onChange={(e) => setCode(e.target.value.trim())}
+            placeholder="Код приглашения"
+            autoCapitalize="off"
+            autoCorrect="off"
+            spellCheck={false}
+          />
+          <button className="sact ghost full" disabled={!code || busy} onClick={useCode}>
+            {busy ? "Подключаюсь…" : "Подключиться по коду"}
+          </button>
+        </div>
+
+        <p className="hint">
+          Записи хранятся на вашем сервере и на телефоне. Второй родитель
+          подключается по приглашению из настроек.
+        </p>
+      </div>
+    </div>
+  );
+}

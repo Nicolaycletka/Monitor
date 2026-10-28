@@ -1,0 +1,11 @@
+node_modules
+web/dist
+data
+.env
+
+# Capacitor
+android/app/build/
+android/.gradle/
+android/build/
+android/local.properties
+android/app/src/main/assets/public/
