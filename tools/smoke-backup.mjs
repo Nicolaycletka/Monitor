@@ -12,8 +12,11 @@
  * в приложении: если прогноз считается — копия рабочая.
  */
 import { readFileSync } from "node:fs";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { dirname, join } from "node:path";
 const dump = JSON.parse(readFileSync(process.argv[2] || "dump.json","utf8"));
-const S = await import("/home/claude/bt/baby-tracker/web/src/sleep.js");
+const SLEEP_SRC = process.env.SLEEP_SRC || join(dirname(fileURLToPath(import.meta.url)), "..", "web", "src", "sleep.js");
+const S = await import(pathToFileURL(SLEEP_SRC));
 let bad=0; const check=(l,c,e="")=>{if(!c)bad++;console.log((c?"  ок  ":"ПРОВАЛ")+"  "+l+(e?"  — "+e:""));};
 check("есть профиль с датой рождения", Number.isFinite(dump.profile?.birth));
 check("есть события", Array.isArray(dump.events) && dump.events.length>0, `${dump.events?.length}`);

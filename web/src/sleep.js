@@ -299,7 +299,7 @@ const inNightHours = (ts) => {
 function markMerged(arr) {
   Object.defineProperty(arr, "_merged", { value: true });
   Object.defineProperty(arr, "_healthy", { value: true });
-  return arj;
+  return arr;
 }
 function sliceMerged(arr, from, to) {
   return markMerged(arr.slice(from, to));
