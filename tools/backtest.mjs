@@ -1,9 +1,21 @@
 /* Walk-forward: для каждого ДНЕВНОГО сна прогноз строится только по
  * данным строго до него. Никакого подглядывания в будущее. */
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+/*
+ * Путь к модулю прогноза считается от расположения самого инструмента,
+ * а не берётся абсолютным. Раньше здесь стоял путь с машины, где
+ * инструмент писали: на любом другом клоне (в том числе на сервере,
+ * где лежит /opt/monitor) backtest и evaluate падали с ENOENT, то есть
+ * проверить точность перед деплоем было нечем.
+ */
+const HERE = dirname(fileURLToPath(import.meta.url));
+const SLEEP_SRC = process.env.SLEEP_SRC || join(HERE, "..", "web", "src", "sleep.js");
 
 export async function loadModule(patch = {}) {
-  let src = readFileSync("/home/claude/bt/baby-tracker/web/src/sleep.js", "utf8");
+  let src = readFileSync(SLEEP_SRC, "utf8");
   for (const [k, v] of Object.entries(patch)) {
     const re = new RegExp(`export const ${k} = [^;]+;`);
     if (!re.test(src)) throw new Error(`не найдена константа ${k}`);
