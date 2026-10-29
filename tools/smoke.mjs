@@ -13,7 +13,7 @@ for (const k of ["navigator","HTMLElement","Element","Node","SVGElement","getCom
 globalThis.matchMedia = () => ({ matches:false, addListener(){}, removeListener(){}, addEventListener(){}, removeEventListener(){} });
 globalThis.fetch = async () => ({ ok:false, status:0, json: async()=>({}) });
 
-const raw = JSON.parse(readFileSync(process.argv[2] || "/tmp/export.json","utf8"));
+const raw = JSON.parse(readFileSync(process.argv[2] || "/mnt/user-data/uploads/sleep-2026-08-30.json","utf8"));
 await new Promise((res, rej) => {
   const r = indexedDB.open("baby-tracker", 1);
   r.onupgradeneeded = () => r.result.createObjectStore("kv");

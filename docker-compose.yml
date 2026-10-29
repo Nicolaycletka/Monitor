@@ -1,0 +1,20 @@
+services:
+  app:
+    build:
+      context: .
+      args:
+        # с каким префиксом собирать фронтенд ("/" — корень сайта)
+        BASE_PATH: /monitor/
+    restart: unless-stopped
+    ports:
+      # 8080 занят masquerade-блоком nginx, поэтому 8090
+      - "127.0.0.1:8090:8090"
+    volumes:
+      - ./data:/data
+    environment:
+      - NODE_ENV=production
+      - PORT=8090
+      - BASE_PATH=/monitor
+      # токен бота — не хранить прямо тут (файл в git), см. .env рядом
+      # с docker-compose.yml на VPS (docker compose подхватывает его сам)
+      - TG_BOT_TOKEN=${TG_BOT_TOKEN}
