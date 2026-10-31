@@ -1,10 +1,10 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import {
   MIN, DAY, startOfDay, hhmm, dur, durShort, ageText, ageMonths, dayLabel,
-  sleepNorm, isNightSleep, isNight, autoNight, nightFragments, sourceScores, pickSource, sourceLabel, TABLES, PICK_MARGIN, predictNext, daySegments, dayStats, measureBias,
+  sleepNorm, isNightSleep, isNight, autoNight, nightFragments, sourceLabel, TABLES, PICK_MARGIN, daySegments, dayStats, measureBias,
   medianNapIn, typicalNap, autoBias, settleOf, settleStats,
   settleShare, settleNudge, SETTLE_KINDS, SETTLE_LABEL, SETTLE_HINT, RAW_ALARM,
-  selfCheck, biasProfile, WINDOW_HALF,
+  biasProfile, WINDOW_HALF,
   PICK_TAIL,
 } from "./sleep.js";
 import {
@@ -14,6 +14,7 @@ import {
   exportToTelegram, exportLink, BUNDLED,
 } from "./store.js";
 import { isUpdateAvailable } from "./build-check.js";
+import { predictAsync, qualityAsync } from "./analysis.js";
 import * as localNotify from "./notify-local.js";
 import * as sleepNote from "./sleep-notification.js";
 import {
@@ -123,6 +124,15 @@ const noonOf = (isoStr) => {
 
 /* ================================================================== */
 
+/*
+ * Синк каждые 30 секунд отправляет на сервер время уведомления о сне,
+ * а для этого нужен прогноз. Раньше синк считал его сам в основном
+ * потоке — отсюда подвисания раз в полминуты и сразу после каждой
+ * отметки (синк идёт через 800 мс после неё). Теперь — тот же фоновый
+ * поток, что и для экрана; одинаковые данные он второй раз не считает.
+ */
+const SYNC_OPTS = { predict: predictAsync };
+
 export default function App() {
   const [state, setState] = useState(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -182,7 +192,7 @@ export default function App() {
     if (!s?.auth?.token) return;
     setNet((n) => ({ ...n, status: "syncing" }));
     try {
-      const merged = await syncOnce(s);
+      const merged = await syncOnce(s, SYNC_OPTS);
       if (merged) {
         setState(merged);
         saveState(merged);
@@ -215,7 +225,7 @@ export default function App() {
       const next = await relink(s);
       setState(next);
       saveState(next);
-      const merged = await syncOnce(next);
+      const merged = await syncOnce(next, SYNC_OPTS);
       if (merged) {
         setState(merged);
         saveState(merged);
@@ -248,7 +258,7 @@ export default function App() {
         profileDirty: false,
         events: (s.events || []).map((e) => ({ ...e, dirty: true })),
       };
-      const merged = (await syncOnce(next)) || next;
+      const merged = (await syncOnce(next, SYNC_OPTS)) || next;
       setState(merged);
       saveState(merged);
       history.replaceState(null, "", import.meta.env.BASE_URL);
@@ -365,12 +375,22 @@ export default function App() {
     }
     let alive = true;
     setWinBusy(true);
+    /*
+     * Расчёт идёт в фоновом потоке (analysis.js): раньше он шёл здесь же,
+     * в основном, и хотя был отложен на четверть секунды, всё равно
+     * замораживал экран на всё время счёта — нажатия и переключения
+     * вкладок в этот момент просто не доходили.
+     */
     const id = setTimeout(() => {
-      const w = predictNext(events, birth, winMinute * 60000, state?.bias || 0);
-      if (!alive) return;
-      setWin(w);
-      setWinBusy(false);
-    }, 250);
+      predictAsync(events, birth, winMinute * 60000, state?.bias || 0).then(
+        (w) => {
+          if (!alive) return;
+          setWin(w);
+          setWinBusy(false);
+        },
+        () => { if (alive) setWinBusy(false); } // старое окно лучше пустоты
+      );
+    }, 100);
     return () => {
       alive = false;
       clearTimeout(id);
@@ -1288,6 +1308,28 @@ function IllnessCard({ periods, onSave, onRemove }) {
 }
 
 function WeekView({ state, events, nights, update, onSaveIllness, onRemoveIllness }) {
+  /*
+   * Самопроверка и сравнение источников — проверки задним числом, самый
+   * тяжёлый расчёт вкладки. Раньше они шли прямо в рендере, и вкладка
+   * открывалась секундами (на длинном дневнике — десятками секунд).
+   * Теперь вкладка рисуется сразу, а эти карточки досчитываются в
+   * фоновом потоке и появляются следом. Прежний ответ держится, пока
+   * считается новый.
+   *
+   * Хук стоит первым в функции — до любых условных веток (см. историю
+   * с «Rendered more hooks» в App).
+   */
+  const birthW = state.profile.birth;
+  const [quality, setQuality] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    qualityAsync(events, birthW, Date.now()).then(
+      (q) => { if (alive) setQuality(q); },
+      () => {}
+    );
+    return () => { alive = false; };
+  }, [events, birthW]);
+
   const today = startOfDay(Date.now());
   const days = Array.from({ length: 7 }, (_, i) => today - (6 - i) * DAY);
   const stats = days.map((d) => dayStats(events, d, nights));
@@ -1318,7 +1360,7 @@ function WeekView({ state, events, nights, update, onSaveIllness, onRemoveIllnes
   const illnessEvents = events
     .filter((e) => e.type === "illness" && !e.deleted)
     .sort((a, b) => b.start - a.start);
-  const check = selfCheck(events, state.profile.birth);
+  const check = quality?.check ?? null;
   const shares = settleShare(events, Date.now(), state.profile.birth);
   const bias = measureBias(events, state.profile.birth);
   const auto = autoBias(bias, shares.hardShare, shares.alertShare);
@@ -1588,7 +1630,7 @@ function WeekView({ state, events, nights, update, onSaveIllness, onRemoveIllnes
       </div>
 
       <div className="sec">Точность прогноза</div>
-      <QualityCard state={state} events={events} />
+      <QualityCard quality={quality} />
 
       <div className="sec">Кормления</div>
       <FeedModelCard state={state} events={events} />
@@ -2314,11 +2356,16 @@ function NotifyPrefs({ state, update }) {
  * «почти попадало». Ширина теперь постоянная, промах виден — значит
  * его надо показывать, а не прятать.
  */
-function QualityCard({ state, events }) {
-  const { profile } = state;
-  const now = Date.now();
-  const scores = sourceScores(events, profile.birth, now);
-  const pick = pickSource(events, profile.birth, now);
+function QualityCard({ quality }) {
+  // считается в фоновом потоке (см. WeekView); null — ещё не готово
+  if (!quality) {
+    return (
+      <div className="bt-card">
+        <p className="hint" style={{ marginTop: 0 }}>Считаю точность прогноза…</p>
+      </div>
+    );
+  }
+  const { scores, pick } = quality;
 
   if (!scores) {
     return (

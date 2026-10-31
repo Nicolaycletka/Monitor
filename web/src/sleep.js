@@ -1,10 +1,25 @@
 export const MIN = 60000;
 export const DAY = 86400000;
 
+/*
+ * Полночь по местному времени. Зовётся в расчёте прогноза десятки
+ * тысяч раз, и каждый раз — новый Date. Ответ одинаков для всех
+ * моментов внутри одного 15-минутного интервала (переходы на летнее
+ * время во всех поясах происходят на границе четверти часа), так что
+ * кешируем по нему. Кеш ограничен, чтобы не расти бесконечно.
+ */
+const dayCache = new Map();
+const Q15 = 15 * 60000;
 export const startOfDay = (ts) => {
+  const k = Math.floor(ts / Q15);
+  const hit = dayCache.get(k);
+  if (hit !== undefined) return hit;
   const d = new Date(ts);
   d.setHours(0, 0, 0, 0);
-  return d.getTime();
+  const v = d.getTime();
+  if (dayCache.size > 20000) dayCache.clear();
+  dayCache.set(k, v);
+  return v;
 };
 
 export const hhmm = (ts) =>
@@ -182,7 +197,23 @@ export function sleepNorm(m) {
 export const NIGHT_MIN_MINUTES = 180;
 export const DEEP_NIGHT_HOUR = 22;
 
+/*
+ * Ответ для закрытого сна зависит только от start/end, а спрашивают его
+ * в циклах проверки задним числом тысячи раз на один и тот же объект —
+ * и каждый раз это два Date. Запоминаем рядом со start/end, чтобы
+ * правка объекта на месте (если где-то случится) не дала старый ответ.
+ * Открытый сон не кешируется: его ответ зависит от текущего времени.
+ */
+const nightMemo = new WeakMap();
 export const isNightSleep = (ev) => {
+  if (ev.end == null) return isNightSleepRaw(ev);
+  const m = nightMemo.get(ev);
+  if (m && m.start === ev.start && m.end === ev.end) return m.v;
+  const v = isNightSleepRaw(ev);
+  nightMemo.set(ev, { start: ev.start, end: ev.end, v });
+  return v;
+};
+function isNightSleepRaw(ev) {
   const h = new Date(ev.start).getHours();
   if (h >= DEEP_NIGHT_HOUR || h < 5) return true;
   if (h < 18) return false;
@@ -193,7 +224,7 @@ export const isNightSleep = (ev) => {
   const deep = new Date(ev.start);
   deep.setHours(DEEP_NIGHT_HOUR, 0, 0, 0);
   return end >= deep.getTime();
-};
+}
 
 /* ---------- периоды болезни ---------- */
 
@@ -595,12 +626,46 @@ export const FIT_SHRINK = 6;
 export const FIT_DAYS = 21;
 
 /** Прогресс дня для исторического сна — тот же расчёт, что в predictWindow. */
+/*
+ * Индекс ночных снов по дню их окончания, один на массив.
+ *
+ * Раньше progressAt на КАЖДЫЙ сон заново фильтровал всю историю, а
+ * вызывается он внутри typicalNap и personalWindow, которые сами сидят
+ * в циклах проверки задним числом (selfCheck, measureBias,
+ * sourceScores). Получалась кубическая сложность: на дневнике в три
+ * месяца вкладка «Неделя» и любой синк замораживали телефон на
+ * десятки секунд.
+ *
+ * Индекс даёт ровно тот же ответ: те же ночные сны, в том же порядке
+ * массива, «последний» — последний по порядку, как и было у filter.
+ * Длина хранится рядом, чтобы массив, дописанный после построения
+ * индекса, не получил устаревший ответ.
+ */
+const nightIndexCache = new WeakMap();
+function nightIndex(sleeps) {
+  const hit = nightIndexCache.get(sleeps);
+  if (hit && hit.len === sleeps.length) return hit.byDay;
+  const byDay = new Map();
+  for (const x of sleeps) {
+    if (!isNightSleep(x)) continue;
+    const d = startOfDay(x.end);
+    let list = byDay.get(d);
+    if (!list) byDay.set(d, (list = []));
+    list.push(x);
+  }
+  nightIndexCache.set(sleeps, { len: sleeps.length, byDay });
+  return byDay;
+}
+
 function progressAt(sleeps, prev) {
   const day0 = startOfDay(prev.end);
-  const nightsToday = sleeps.filter(
-    (x) => isNightSleep(x) && x.end >= day0 && x.end < day0 + 14 * 3600000 && x.end <= prev.end
-  );
-  const morning = nightsToday.length ? nightsToday[nightsToday.length - 1].end : day0 + 7 * 3600000;
+  // x.end >= day0 обеспечивает сам ключ индекса: startOfDay(x.end) === day0
+  const sameDay = nightIndex(sleeps).get(day0) || [];
+  let last = null;
+  for (const x of sameDay) {
+    if (x.end < day0 + 14 * 3600000 && x.end <= prev.end) last = x;
+  }
+  const morning = last ? last.end : day0 + 7 * 3600000;
   const bedtime = day0 + 20 * 3600000;
   return isNightSleep(prev) ? 0 : clamp01((prev.end - morning) / (bedtime - morning));
 }
@@ -751,8 +816,10 @@ export function predictWindow(events, birth, now, bias = 0, opts = {}) {
   const cw = clamp01((ageM - 2.5) / 1);
   const circadian = cw > 0;
 
-  const nightsToday = sleeps.filter(
-    (s) => isNightSleep(s) && s.end >= day0 && s.end < day0 + 14 * 3600000
+  // тот же индекс, что у progressAt: predictWindow зовётся в циклах
+  // проверки задним числом, и полный проход здесь тоже копился
+  const nightsToday = (nightIndex(sleeps).get(day0) || []).filter(
+    (s) => s.end < day0 + 14 * 3600000
   );
   const knownMorning = nightsToday.length > 0;
   const morning = knownMorning

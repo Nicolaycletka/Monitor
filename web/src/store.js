@@ -220,7 +220,7 @@ function devPushTime(at, now = Date.now()) {
   return d.getTime();
 }
 
-function computeNotify(state) {
+function computeNotify(state, win) {
   if (!state.profile?.birth) return null;
   const events = liveEvents(state.events || []);
   const { birth, sex, name } = state.profile;
@@ -252,7 +252,6 @@ function computeNotify(state) {
   if (active) return { sleep: null, feed: null, dev: devN };
 
   let sleepN = null;
-  const win = predictNext(events, birth, Math.floor(Date.now() / 60000) * 60000, state.bias || 0);
   if (win && !win.stale) {
     sleepN = {
       at: toMinute(win.calm),
@@ -305,8 +304,29 @@ const stripLocal = (e) => ({
  * Один проход синхронизации. Возвращает новое состояние либо null,
  * если синхронизировать нечего или сеть недоступна.
  */
-export async function syncOnce(state) {
+/*
+ * Прогноз для уведомления о сне. Считается до запроса, а не внутри
+ * computeNotify: расчёт асинхронный (фоновый поток, см. analysis.js).
+ * Без `opts.predict` (инструменты, тесты) — прямо здесь, как раньше.
+ * Пока ребёнок спит, окно не нужно вовсе — и не считаем.
+ */
+async function notifyWindow(state, opts) {
+  if (!state.profile?.birth) return null;
+  const events = liveEvents(state.events || []);
+  if (events.some((e) => e.type === "sleep" && !e.end)) return null;
+  const now = Math.floor(Date.now() / 60000) * 60000;
+  const predict = opts?.predict || predictNext;
+  try {
+    return await predict(events, state.profile.birth, now, state.bias || 0);
+  } catch {
+    return null; // без окна синк всё равно должен пройти — записи важнее
+  }
+}
+
+export async function syncOnce(state, opts = {}) {
   if (!state.auth?.token) return null;
+
+  const win = await notifyWindow(state, opts);
 
   const dirty = state.events.filter((e) => e.dirty);
   const pushed = new Map(dirty.map((e) => [e.id, e.updatedAt]));
@@ -321,7 +341,7 @@ export async function syncOnce(state) {
       since: state.rev || 0,
       events: dirty.map(stripLocal),
       profile: state.profileDirty && state.profile ? state.profile : undefined,
-      notify: computeNotify(state),
+      notify: computeNotify(state, win),
     }),
   });
 

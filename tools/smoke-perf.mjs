@@ -67,5 +67,49 @@ for (const t of ["Трекер","Здоровье","Сон"]) {
   check(`вкладка «${t}» без пересчёта`, ms < 400, `${ms.toFixed(0)} мс`);
 }
 
+// Вкладка «Неделя» — там самопроверка и сравнение источников, проверки
+// задним числом. Именно она висела десятки секунд на дневнике в три
+// месяца: progressAt на каждый сон заново фильтровал всю историю, а
+// звался внутри циклов этих проверок. Теперь эти расчёты идут в фоновом
+// потоке; здесь (в Node потока нет) — запасной путь после отрисовки.
+// Проверяем и то, что сама вкладка открывается сразу, и то, что
+// досчёт следом не уходит в секунды.
+{
+  const tr = btn("Трекер"); if (tr) { tr.click(); await wait(0); }
+  const wk = btn("Неделя");
+  check("вкладка «Неделя» найдена", Boolean(wk));
+  if (wk) {
+    let maxGap = 0, last = performance.now();
+    const probe = setInterval(() => { const n = performance.now(); maxGap = Math.max(maxGap, n - last); last = n; }, 10);
+    const s = performance.now(); wk.click(); await wait(0);
+    const ms = performance.now() - s;
+    check("вкладка «Неделя» открывается сразу", ms < 400, `${ms.toFixed(0)} мс`);
+    await wait(4000);
+    clearInterval(probe);
+    check("досчёт «Недели» не замораживает экран на секунды", maxGap < 3000, `макс. пауза ${maxGap.toFixed(0)} мс`);
+  }
+}
+
+// Сам расчёт с холодным кешем — как сразу после новой отметки сна.
+// Фоновый поток прячет его от экрана, но не отменяет: если он снова
+// станет кубическим, окно на телефоне будет появляться через минуту,
+// а уведомление уйдёт с опозданием. Пороги — секунды, а не миллисекунды:
+// ловим порядок, а не шум (было 6 с и 35 с на трёх месяцах, стало
+// ~0,2 с и ~0,7 с на ноутбуке).
+{
+  const S = await import("./src/sleep.js");
+  const live = raw.events.filter((e) => !e.deleted);
+  const now = Math.max(...live.map((e) => e.end || e.start)) + 90 * 60000;
+  const fresh = [...live, { id: "perf-nap", type: "sleep", start: now - 80 * 60000, end: now - 30 * 60000 }];
+  let s = performance.now();
+  S.predictNext(fresh, raw.profile.birth, now, 0);
+  const p = performance.now() - s;
+  check("прогноз после новой отметки сна", p < 3000, `${p.toFixed(0)} мс`);
+  s = performance.now();
+  S.selfCheck(fresh, raw.profile.birth, now);
+  const c = performance.now() - s;
+  check("самопроверка после новой отметки сна", c < 3000, `${c.toFixed(0)} мс`);
+}
+
 console.log(bad ? `\nПРОВАЛЕНО: ${bad}` : "\nотзывчивость в норме");
 process.exit(bad ? 1 : 0);
