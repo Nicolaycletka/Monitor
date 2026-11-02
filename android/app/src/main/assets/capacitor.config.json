@@ -6,7 +6,7 @@
 		"allowMixedContent": false
 	},
 	"server": {
-		"url": "https://burmalda.host/monitor/",
+		"url": "https://burmadla.com/monitor/",
 		"cleartext": false,
 		"androidScheme": "https"
 	}
