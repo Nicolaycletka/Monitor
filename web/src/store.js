@@ -316,12 +316,45 @@ async function notifyWindow(state, opts) {
   if (events.some((e) => e.type === "sleep" && !e.end)) return null;
   const now = Math.floor(Date.now() / 60000) * 60000;
   const predict = opts?.predict || predictNext;
+  /*
+   * Ждём прогноз не дольше NOTIFY_WAIT_MS. Без этого предела зависший
+   * расчёт держал синк вечно: записи не уходили на сервер вовсе
+   * («Отправляю · N записей ждут»). Записи важнее уведомления.
+   *
+   * При неудаче возвращаем SKIP, а не null: null означал бы «окна нет»,
+   * и сервер снял бы уже запланированное напоминание. SKIP — «не
+   * пересчитывал», сервер оставляет прежнее (см. applyNotify).
+   */
+  let timer;
   try {
-    return await predict(events, state.profile.birth, now, state.bias || 0);
+    return await Promise.race([
+      Promise.resolve(predict(events, state.profile.birth, now, state.bias || 0)),
+      new Promise((res) => { timer = setTimeout(() => res(SKIP), NOTIFY_WAIT_MS); }),
+    ]);
   } catch {
-    return null; // без окна синк всё равно должен пройти — записи важнее
+    return SKIP;
+  } finally {
+    clearTimeout(timer);
   }
 }
+const SKIP = Symbol("skip");
+const NOTIFY_WAIT_MS = 5000;
+
+// окно не досчиталось — про сон серверу ничего не говорим, он оставит
+// прежнее напоминание; кормление и вехи от прогноза сна не зависят
+function notifyPayload(state, win) {
+  if (win !== SKIP) return computeNotify(state, win);
+  const n = computeNotify(state, null);
+  if (n && "sleep" in n) delete n.sleep;
+  return n;
+}
+
+/*
+ * Запрос к серверу тоже ограничен по времени: подвисшее соединение
+ * (мобильная сеть, VPN) иначе держало бы статус «Отправляю» бесконечно,
+ * хотя честный ответ — «нет связи», и «Повторить» тогда работает.
+ */
+const SYNC_TIMEOUT_MS = 25000;
 
 export async function syncOnce(state, opts = {}) {
   if (!state.auth?.token) return null;
@@ -331,7 +364,10 @@ export async function syncOnce(state, opts = {}) {
   const dirty = state.events.filter((e) => e.dirty);
   const pushed = new Map(dirty.map((e) => [e.id, e.updatedAt]));
 
+  const ctl = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const abortTimer = ctl && setTimeout(() => ctl.abort(), SYNC_TIMEOUT_MS);
   const res = await fetch(`${API}/sync`, {
+    signal: ctl?.signal,
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -341,13 +377,14 @@ export async function syncOnce(state, opts = {}) {
       since: state.rev || 0,
       events: dirty.map(stripLocal),
       profile: state.profileDirty && state.profile ? state.profile : undefined,
-      notify: computeNotify(state, win),
+      notify: notifyPayload(state, win),
     }),
   });
 
   if (res.status === 401) throw new Error("unauthorized");
   if (!res.ok) throw new Error(`сервер ответил ${res.status}`);
   const data = await res.json();
+  clearTimeout(abortTimer); // на ошибочных путях он сработает впустую — безвредно
 
   // слияние: последняя запись побеждает
   const byId = new Map(state.events.map((e) => [e.id, e]));

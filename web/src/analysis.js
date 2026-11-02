@@ -63,16 +63,43 @@ function runLocal(kind, payload) {
   });
 }
 
+/*
+ * Сторож. Ответ потока, который не пришёл, раньше ждался вечно — и
+ * вместе с ним вечно ждали окно на экране и синк (он берёт прогноз
+ * отсюда же). Так и случилось в проде: «Отправляю · 2 записей ждут»
+ * без конца. Теперь каждый запрос ограничен по времени; по истечении
+ * поток перезапускается, а запрос завершается ошибкой — вызывающие
+ * её переживают (экран держит прежнее окно, синк уходит без него).
+ */
+export const JOB_TIMEOUT_MS = 20000;
+
+function killWorker() {
+  try { worker?.terminate(); } catch { /* уже мёртв */ }
+  worker = null;
+}
+
 function send(kind, payload) {
   const w = getWorker();
   if (!w) return runLocal(kind, payload);
   return new Promise((resolve, reject) => {
     const id = ++seq;
-    inflight.set(id, { kind, payload, resolve, reject });
+    const timer = setTimeout(() => {
+      if (!inflight.has(id)) return;
+      // поток завис или считает недопустимо долго — перезапускаем его;
+      // остальные ожидающие тоже завершаются, иначе они повисли бы
+      // на уже убитом потоке
+      const jobs = [...inflight.values()];
+      inflight.clear();
+      killWorker();
+      for (const j of jobs) j.reject(new Error("timeout"));
+    }, JOB_TIMEOUT_MS);
+    const done = (fn) => (v) => { clearTimeout(timer); fn(v); };
+    inflight.set(id, { kind, payload, resolve: done(resolve), reject: done(reject) });
     try {
       w.postMessage({ id, kind, p: payload });
     } catch (err) {
       // данные не клонируются — считаем здесь, это не повод оставить экран без окна
+      clearTimeout(timer);
       inflight.delete(id);
       runLocal(kind, payload).then(resolve, reject);
     }
